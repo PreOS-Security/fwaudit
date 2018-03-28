@@ -1,0 +1,32 @@
+Changelog
+=========
+
+2018/03/25
+ + Version 0.0.1-PRE-ALPHA, aka Milestone 1 (M1)
+ + Initial release. Not ready for most users. :-)
+ + List of requirements: 
+    * Intel x64 UEFI system
+    * Debian/Ubuntu-based Linux
+    * CPython v2.7x
+ + List of supported Tools:
+    * CHIPSEC (a few tools)
+    * FWTS (a few tools)
+    * acpidump
+    * dmidecode
+    * lspci
+    * lsusb
+  + List of supported Profiles:
+    * Profiles not useful yet, just use single tools in this release.
+  + List of known defects (or lack of features):
+    * Fails to run second -t or -p, only first -p or t run.
+    * Check if tool exists before spawning it, and catch errno2 properly.
+    * Generate sha256sum-compatible manifest.txt with hashes of all
+      generated files.
+    * Exception handling code needs improving, some exceptions not logged
+      or recovered properly, scope of exceptions insufficient.
+    * Profile code does not work well, use a single tool at at time for M1
+    * If CHIPSEC install does not support "chipsec_main", and only works
+      with "python -m chipsec_main", on the local system, then the chipsec
+      commands will not work.
+
+EOF 
