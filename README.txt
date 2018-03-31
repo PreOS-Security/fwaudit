@@ -29,7 +29,7 @@ Tool Resources:
 * LICENSE.txt: the legal license file.
 * HACKING.txt: contributor guide, includes list of needed fixes/features.
 * CHANGELOG.txt: the list of changes, by release.
-* Home page, <https://preossec.com//products/fwaudit/> (not live now, coming soon).
+* Home page, <https://preossec.com/products/fwaudit/> (not live now, coming soon).
 * Feedback alias, <mailto:fwaudit@preossec.com>.
 * Announce mailing list, <https://lists.preossec.com/mailman/listinfo/fwaudit-announce_lists.preossec.com/>.
 * Source code, <https://github.com/PreOS_Security/fwaudit/>.
