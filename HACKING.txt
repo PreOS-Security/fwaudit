@@ -1,4 +1,4 @@
-FWAudit Hacker's Guide
+# FWAudit Hacker's Guide
 ======================
 
 If you'd like to contribute to the project, here are some needed features.
