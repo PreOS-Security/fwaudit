@@ -113,7 +113,9 @@ fwaudit does not currently have any packaging, or standard installation director
 
 ## Usage
 
-$ sudo python2 ./fwaudit.py -h
+The help and --list_tools options can be run without sudo:
+
+$ ./fwaudit.py -h
 
 Gives:
 
@@ -142,6 +144,12 @@ optional arguments:
                         Specify how to log tool output.
   -c, --colorize        Use colored output for interactive console.
   --hash                Generate SHA256 sidecar hash files for all files.
+
+$ ./fwaudit.py --list_tools
+
+Running a tool requires sudo:
+
+$ sudo ./fwaudit.py -t lsusb
 
 ## Updates & Discussion
 
