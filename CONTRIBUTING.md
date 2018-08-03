@@ -13,14 +13,16 @@ The M1 tool code needs refactoring, to remove the tool-centric code,
 moving the tool-centric data into a user-editable JSON file. Post-M2,
 please, submit lots of JSON-based tool/profile patches!
 
-Regarding coding style: 
+## Coding style: 
+
 A few suggestions for any developers who wish to contribute:
 * This Python code may be ported to C. Please avoid advanced Python
   features such as: comprehensions, generators, lambdas, etc.
 * The code needs to be ported to 3.x, but also must continue to run on 2.7x,
   since the UEFI CHIPSEC requires CPython 2.7x.
 
-Testing:
+## Testing:
+
 * Running tools on diverse, wide selection of different OEM models of
   systems, checking for unexpected failure and tool behavior, and
   model-specific arguments (eg, for flashrom or pawn, to dump a rom on
@@ -32,7 +34,8 @@ Testing:
 * Test with Python implementations other than CPython
 * Test under hypervisors: QEMU, VirtualBox, Hyper-V, etc.
 
-Core App Features:
+## Core App Features:
+
 * Split into multiple source files
 * Watch for crashed exec tools, watchdog process, kill after timeout?
 * Check if needed tool is available before running, SKIP relevent tests
@@ -61,7 +64,8 @@ Core App Features:
 * Port to Python implementations beyond CPython: MicroPython, PyPy,
    Stackless, Nuitka, IronPython, ...
 
-Domain-centric App Features:
+## Domain-centric App Features:
+
 * M2: Remove hardcoded tool-centric code, create user-editable tools.json
   and profiles.json! Add JSON entries for many tools and profiles
 * Create per-tool help docs to help user install tool on their OS/distro
@@ -76,7 +80,8 @@ Domain-centric App Features:
 * Research PII issues of OSVs/OEMs/IBVs/etc implementations to avoid,
   UEFI NVRAM-auth, UEFI vars, ...
 
-External tools (M2-onward):
+## External tools (M2-onward):
+
 * More of CHIPSEC tools
 * More of FWTS tools
 * More ACPICA tools
@@ -95,13 +100,15 @@ External tools (M2-onward):
 * Vendor (and third-party) detection tools from all recent HW/FW-related
   CVEs/advisories
 
-ARCH/OS Ports:
+## ARCH/OS Ports:
+
 * AArch64
 * x86
 * AArch32
 * OpenPOWER
 
-OS Packaging:
+## OS Packaging:
+
 * Windows: native Win32/Win64, CygWin, WSL
 * macOS: DMG of PKG, Homebrew
 * Linux: Fedora, OpenSUSE, Arch, Ubuntu, Yocto
