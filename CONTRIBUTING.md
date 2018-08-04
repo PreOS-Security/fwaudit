@@ -1,11 +1,12 @@
-# FWAudit Hacker's Guide
+# fwaudit Hacker's Guide
 ======================
 
 If you'd like to contribute to the project, here are some needed features.
 Most of the current code needs to be updated to fix defects, or refactored
 to be more Pythonic.
 
-The current FWAudit release is 0.0.1-PRE-ALPHA, Milestone 1 (M1).
+The current fwaudit release is 0.0.2-PRE-ALPHA.
+
 Items planned on being addressed in the next release are marked with 'M2'.
 
 Regarding adding new tools/profiles, please hold off until after M2.
