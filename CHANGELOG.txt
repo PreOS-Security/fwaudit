@@ -1,6 +1,10 @@
 Changelog
 =========
 
+2018/08/04
+ + Version 0.0.2-PRE-ALPHA
+ + added syslog
+
 2018/03/25
  + Version 0.0.1-PRE-ALPHA, aka Milestone 1 (M1)
  + Initial release. Not ready for most users. :-)
