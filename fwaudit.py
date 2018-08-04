@@ -3,23 +3,38 @@
 # vim: set expandtab sw=4 :
 
 '''
-Firmware Audit, v0.0.1-PRE-ALPHA
+Firmware Audit, v0.0.2-PRE-ALPHA
 Copyright (C) 2017-2018 PreOS Security Inc.
 All Rights Reserved.
 
 This code is licensed using GPLv2, see LICENSE.txt.
 
-Firmware Audit is a firmware analysis tool for SysAdmins/DFIR. It calls
-multiple tools (eg, CHIPSEC, FWTS, etc.) and gathers the results for
-future forensic analysis.
+Firmware Audit is a firmware analysis tool which calls multiple tools
+(eg, CHIPSEC, FWTS, etc.) and gathers the results for forensic analysis.
 
 For more information, see README.txt.
 
-WARNING: This is the initial public release of this tool, aka Milestone1.
+WARNING: This is the 2 public release of this tool, aka Milestone2.
 It really is *PRE-ALPHA* quality! There are many defects, and few features.
-You should hold off until Milestone 2 or 3, when it should be more stable
+You should hold off until Milestone 3, when it should be more stable
 and useful. Thanks for your patience.
 '''
+
+# XXX new bugs/issues from 0.2:
+# BUG: stdio file has "<toolname>." prefix, remove. Eg, lspci.stdout.txt should be stdout.txt.
+# BUG: Python's os.getgroups() and os.setgroups() behave differently on Linux than on MacOSX. Need to ensure that the sudo code works on Mac.
+# BUG: Syslog (and eventually EventLog) output is a mirror of stdout, too much spew for syslog.  Update syslog output to be: list of tools run with status, list of generated files with hashes, aka the index/report.
+# BUG: everyplace a file is opened, should first check for a max size, in case file is huge. Unclear how big some rom.bins get. Need a user-specifed max, and understand the various system max values.
+# BUG: After initial creation of dir, don't keep updating owner/group/file-mode each run, only do that once.
+# BUG: global: standardize use of exceptions, int and bool return codes, some rcs overwritten raise LookupError("Invalid user: {!r}".format(foo))
+# BUG: CHIPSEC blacklist args not working, get_tool_arg()/set_tool_arg() list/dict issue.
+# TEST:  test sidecar hash file format against sha256sum tool.
+# TEST: sudo use with a user account and/or a root account that has multiple group memberships.
+# TEST: sidecar hash files against sha26sum
+# TEST: manifest files against sha256sum (or ??)
+# DOC: If SUDO used so that no SUDO_* environment variables are used, this code will not work.
+# DOC: The --output_dir command currently only works for the root user, not the sudo case.
+
 
 from __future__ import print_function
 from __future__ import division
@@ -34,11 +49,20 @@ import hashlib
 import base64
 import textwrap
 import uuid
-import pwd
 import ctypes
 import site
 import time
 import errno
+import stat
+import pwd
+import grp
+import getpass
+
+EVENTLOG_AVAILABLE = True
+try:
+    import windows_eventlog  # XXX proper module name
+except ImportError:
+    EVENTLOG_AVAILABLE = False
 
 SYSLOG_AVAILABLE = True
 try:
@@ -53,7 +77,7 @@ except ImportError:
 # Global variable: APP_METADATA
 
 # XXX which of these are Python/PEP/PyPI standards?
-__version__ = '0.0.1'
+__version__ = '0.0.2'
 __status__ = 'PRE-ALPHA'
 __author__ = 'PreOS Security Inc'
 __copyright__ = 'Copyright 2017-2018, PreOS Security'
@@ -64,8 +88,8 @@ __license__ = 'GPL-2.0'
 # __license__ = 'https://opensource.org/licenses/GPL-2.0'
 
 APP_METADATA = {
-    'home_page': '<https://preossec.com/fwaudit/>',  # XXX create/test
-    'date': '2018-03-24 13:40',
+    'home_page': '<https://preossec.com/>',  # XXX create/test
+    'date': '2018-08-03 19:46',
     'copyright': '2017-2018',
     'short_name': 'fwaudit',
     'full_name': 'FirmWare Audit (FWAudit)',
@@ -164,22 +188,22 @@ app_state = {
     'selected_profile': None,
     'zip_results': False,  # --zip_results
     'output_dir': None,  # --output_dir dir string  (aka 'PD')
+    'output_dir_specified': False,  # user specifed explicit PD using --output_dir
     'per_run_directory': None,
     'colorize': False,  # --colorize
     'omit_pii': False,  # --omit_pii
     'output_mode': 'merged',  # --output_mode
-    'hash_mode': False,  # --hash
+    'hash_mode': False,  # --hash, --nohash
+    'manifest_mode': False,  # --manifest, --nomanifest
     'tools_and_profiles': None,  # sum of all tools + profiles + new_profiles
     'timestamp': None,  # timestamp of run, used to create target dir
     'switchar': '-',  # OS switch character
-    'max_buf': 10000,  # XXX add way to override? Proper value? subprocess
+    'max_buf': 50000,  # XXX add way to override? Proper value? subprocess
     'max_profiles': '1000',
-    'manifest_txt_file': 'manifest.txt',
-    'results_json_file': 'resuts.json',
-    'config_json_file': 'config.json',
-    'index_html_file': 'index.html',
     'meta_profile': [],
     'shell_script_redir_string': None,
+    'sudo_based_usage': False,
+    'output_dir_specified': False,
 }
 
 ############################################################
@@ -229,6 +253,8 @@ app_state = {
 # Add flag if native_spawn, python2_module, load, or other exec method.
 
 # The current code that passes args to tools is ugly, commented out in M1.
+
+# Need per-OS filenames, eg 'acpidump', 'acpidump.exe', 'acpidump.efi'.
 
 TOOLS = [
     {
@@ -999,7 +1025,7 @@ def main():
     tool_status = 0  # XXX need to set during meta_profile run
 
     # Check if stdio redirected, remove colors?
-    # Check if not a TTY, remove colors?
+    # Check if not a TTY?
 
     app_state['switchar'] = switch_character()
     parse_args()
@@ -1035,7 +1061,7 @@ def main():
 
     if (is_none_or_null(app_state['user_profiles']) and
        is_none_or_null(app_state['user_tools'])):
-        error('Need at least one tool or profile to run, none selected')
+        error('No tool(s) or profile selected, use --tool or --profile.')
         info('Use --tool to run a tool, --profile to run a profile of tools')
         info('Multiple uses of --tool and/or --profile allowed')
         info('Use --list_tools and --list_profiles to see available options')
@@ -1043,13 +1069,21 @@ def main():
         # return os.OK  # USAGE NOINPUT NOTFOUND NOPERM
         return 1  # XXX generate exception
 
-    is_root = is_user_root()
-    if not is_root:
+    # XXX If only doing offline analysis, don't need to be root.
+    # Defer root check until after determined what tools are selected,
+    # if each can be run as non-root, then proceed, else this error path.
+    # Will need a boolean in the TOOLS and/or PROFILE struct, or at least
+    # the resulting generated tool list, showing if tool is Live or Offline,
+    # and if tool requires Root or not. Most live tools require root, a few do not.
+    if not is_user_root():
         error('Root privileges needed to run. Retry with sudo.')
         # raise RuntimeError('x')
         # return os.OK  # USAGE NOINPUT NOTFOUND NOPERM
-        # return 1  # XXX generate exception
-        # debug('NOT EXITING! Continuing to run with current privs..')  # XXX 
+        return 1  # XXX generate exception
+
+    if is_sudo_root():
+        # debug('Configuring for SUDO usage')
+        app_state['sudo_based_usage'] = True
 
     status = None
     pd = None
@@ -1067,25 +1101,38 @@ def main():
             error('Unable to create directories, exiting')
             return 1
         # At this point, PD and PRD should be ready to use.
-        # start_results()
+
+        # start_results()  # XXX
+
+        # Run the tools!
         run_meta_profile(pd, prd)
 
-        # Create post-run result files
-        # create_manifest(None, None, None)
-        # create_shellscript()
+        # Post-processing, after running the tools
+        # Create manifest of PD? No files, only dirs.
+        # Create manifest of PRD? No files, only dirs.
+        if is_sudo_root():
+            # XXX need to fix PD dir perms, on first creation?
+            debug('Changing SUDO root ownership/permissions to generated files..')
+            if not change_generated_file_perms(prd):
+                tool_status = 1
+                error('Error occurred during chmod/chgrop post-processing')
+
+        # create_shellscript()  # XXX
+        # XXX create index file, with header, records, and footer of metadata.
         # html_file = os.path.join(prd, app_state['index_html_file'])
         # create_index_html(app_state['timestamp'], html_file)
 
-        # if app_state['zip_results']:
-        #    debug('Creating ZIP file of results..')
-        #    zip_results()
+        # enable zipped results, if user specified.
+        # XXX Delete dir after creating zip.
+        # if app_state['zip_results']:  # XXX
+        #    debug('Creating ZIP file of results..')  # XXX
+        #    zip_results()  # XXX
 
     # Cleanup and terminate.
     shutdown_message(tool_status)
     return tool_status
 
-
-#####################################################################
+############################################################
 
 
 # args.py
@@ -1112,9 +1159,9 @@ def parse_args():
     p.add_argument('--syslog',
                    action='store_true', default=False,
                    help='Send hashes over UNIX SysLog.')
-#    p.add_argument('--eventlog',
-#                   action='store_true', default=False,
-#                   help='Send hashes over Windows EventLog.')
+    p.add_argument('--eventlog',
+                   action='store_true', default=False,
+                   help='Send hashes over Windows EventLog.')
     p.add_argument(c+'V', '--version',
                    action='store_true', default=False,
                    help='Show program version, then exit.')
@@ -1148,16 +1195,25 @@ def parse_args():
     p.add_argument('--output_mode',
                    choices=('merged', 'out_first', 'err_first'),
                    action='store', default=app_state['output_mode'],
-                   help='Specify how to log tool output.')
+                   help='Specify how to log tool output. IN 0.1 RELEASE USE FOR ROOT ONLY, DO NOT USE WITH SUDO USER.')
  #   p.add_argument('--omit_pii',
  #                  action='store_true', default=False,
  #                  help='Omit known PII-centric data from results.')
     p.add_argument(c+'c', '--colorize',
                    action='store_true', default=False,
                    help='Use colored output for interactive console.')
+    p.add_argument('--manifest',
+                   action='store_true', default=False,
+                   help='Generate manifest file of hashes for generated files. DO NOT USE IN 0.1 RELEASE.')
+    p.add_argument('--nomanifest',
+                   action='store_true', default=False,
+                   help='Do not generate manifest files.')
     p.add_argument('--hash',
                    action='store_true', default=False,
-                   help='Generate SHA256 sidecar hash files for all files.')
+                   help='Generate SHA256 sidecar hash files for generated files. DO NOT USE IN 0.1 RELEASE.')
+    p.add_argument('--nohash',
+                   action='store_true', default=False,
+                   help='Do not generate sidecar hash files.')
     # tool-specific options:
 #    # XXX no acpidump or acpixtract option!
 #    p.add_argument('--chipsec_uefi_blacklist', action='store',
@@ -1180,12 +1236,20 @@ def parse_args():
         app_state['verbose'] = True
     if args.debug:
         app_state['debug'] = True
-    if args.syslog:
-        app_state['syslog_mode'] = True
     if args.colorize:
         app_state['colorize'] = True
+    if args.eventlog:
+        app_state['eventlog_mode'] = True
+    if args.syslog:
+        app_state['syslog_mode'] = True
     if args.hash:
         app_state['hash_mode'] = True
+    if args.nohash:
+        app_state['hash_mode'] = False
+    if args.manifest:
+        app_state['manifest_mode'] = True
+    if args.nomanifest:
+        app_state['manifest_mode'] = False
     if args.version:
         app_state['version_mode'] = True
     if args.diags:
@@ -1208,14 +1272,12 @@ def parse_args():
     if args.output_mode:
         app_state['output_mode'] = args.output_mode
     if args.output_dir:
-        app_state['outout_dir'] = args.output_dir
-
-#    if args.eventlog:
-#        app_state['eventlog_mode'] = True
+        app_state['output_dir'] = args.output_dir
+        app_state['output_dir_specified'] = True
+        info('User has specified explicit parent directory of: ' + app_state['output_dir'])
 #    if args.omit_pii:
 #        app_state['omit_pii'] = True
     app_state['omit_pii'] = False
-    app_state['eventlog_mode'] = False
 
     # TOOLS-related options:
 
@@ -1234,7 +1296,6 @@ def parse_args():
 #    if args.chipsec_fw_type:
 #        set_tool_arg('chipsec', 'chipsec_fw_type', args.chipsec_fw_type)
 #        # TOOLS['chipsec_fw_type']['args'] = args.chipsec_fw_type
-
 
 ############################################################
 
@@ -1261,6 +1322,8 @@ def startup_message():
         APP_METADATA['full_author'] + '. All rights reserved.')
     if app_state['syslog_mode']:
         syslog_send(APP_METADATA['short_name'] + ': starting...')
+    if app_state['eventlog_mode']:
+        eventlog_send(APP_METADATA['short_name'] + ': starting...')
     print()
 
 
@@ -1272,14 +1335,19 @@ def shutdown_message(status):
     Send final message to logfile, if --logfile specified.
     '''
     app_name = APP_METADATA['short_name']
+    logmsg = None
     if status == 0:
-        log('Program completed successfully')
+        if app_state['verbose']:
+            log('Program completed successfully')
         logmsg = app_name + ': exiting successfully'
     else:
-        log('Program completed with error(s), status: ' + str(status))
+        if app_state['verbose']:
+            log('Program completed with error(s), status: ' + str(status))
         logmsg = app_name + ': exiting with error(s), status: ' + str(status)
     if app_state['syslog_mode']:
         syslog_send(logmsg)
+    if app_state['eventlog_mode']:
+        eventlog_send(logmsg)
     print()
 
 ############################################################
@@ -1312,7 +1380,6 @@ def output(msg):
     except UnicodeDecodeError:
         sys.exc_info()
         print(repr(msg)[1:-1])
-        # What if this fails, then what?
 
 
 def log(msg, suffix=None, prefix=None,
@@ -1364,7 +1431,7 @@ def log(msg, suffix=None, prefix=None,
     # XXX untested code:
     max_buf = app_state['max_buf']
     if len(msg) > max_buf:
-        output('[ERROR] msg too long to log!, max=' + str(max_buf) + '!')
+        output('[ERROR] msg too long to log!, msg length=' + str(len(msg)) + ', max=' + str(max_buf) + '!')
         return
 
     if prefix is None:
@@ -1382,13 +1449,11 @@ def log(msg, suffix=None, prefix=None,
             prefix_fg_color = ''
             prefix_bg_color = ''
             prefix_reset = ''
-        if ((is_none_or_null(prefix_fg_color)) or
-           ((is_none_or_null(prefix_bg_color)))):
+        if (is_none_or_null(prefix_fg_color)) or ((is_none_or_null(prefix_bg_color))):
             prefix_fg_color = ''
             prefix_bg_color = ''
             prefix_reset = ''
-        if ((is_none_or_null(msg_fg_color)) or
-           ((is_none_or_null(msg_bg_color)))):
+        if (is_none_or_null(msg_fg_color)) or ((is_none_or_null(msg_bg_color))):
             msg_fg_color = ''
             msg_bg_color = ''
             msg_reset = ''
@@ -1412,6 +1477,8 @@ def log(msg, suffix=None, prefix=None,
     # XXX pass integer status code, not just strings.
     if app_state['syslog_mode']:
         syslog_send(prefix + msg + suffix)
+    if app_state['eventlog_mode']:
+        eventlog_send(prefix + msg + suffix)
 
 
 def warning(msg):
@@ -1473,27 +1540,61 @@ def output_wrapped(msg, textwrap_length=72, nocolor=None):
         output(wrapped_msg)
 
 
+def eventlog_send(msg):
+    debug('FIXME: implement eventlog handler')
+    '''Mirrors log message output to eventlog, on Windows systems.
+    
+    Returns True if it worked, False if fails.
+    '''
+    # XXX Test string buffer limits before sending to eventlog
+    if not EVENTLOG_AVAILABLE:
+        output('[ERROR] Windows eventlog Python module not available!')
+        return False
+    if not os_is_windows():
+        output('[ERROR] eventlog only available for Windows systems!')
+        return False
+    if not app_state['eventlog_mode']:
+        output('[ERROR] eventlog code called but eventlog_mode False!')
+        return False
+    if is_none_or_null(msg):
+        output('[ERROR] Empty message, nothing to send to eventlog!')
+        return False
+    try:
+        # XXX eventlog.eventlog(msg)
+        return True
+    except:
+        output('[ERROR] Logger failed to send message to Windows EventLog!')
+        sys.exc_info()
+        output('[WARNING] Disabling Windows EventLog mode after first error.')
+        app_state['eventlog_mode'] = False
+        return False
+    return True
+
+
 def syslog_send(msg):
     '''Mirrors log message output to syslog, on Unix-like systems.
     
     Returns True if it worked, False if fails.
     '''
     # XXX Test string buffer limits before sending to syslog
-    if not SYSLOG_AVAILABLE:
-        output('[ERROR] syslog module not available!')
-        return False
     if not os_is_unix():
-        output('[ERROR] called on a non-UNIX system!')
+        output('[ERROR] syslog only available for UNIX-based systems!')
+        return False
+    if not SYSLOG_AVAILABLE:
+        output('[ERROR] syslog Python module not available!')
         return False
     if not app_state['syslog_mode']:
         output('[ERROR] syslog code called but syslog_mode False!')
         return False
     if is_none_or_null(msg):
-        output('[ERROR] Empty message!')
+        output('[ERROR] Empty message, nothing to send to syslog!')
         return False
     try:
-        return syslog.syslog(msg)
         # syslog.syslog(syslog.LOG_INFO, msg)
+        final_msg = APP_METADATA['short_name'] + ': ' + msg
+        # print('[DEBUG] syslog message: ' + final_msg)
+        syslog.syslog(final_msg)
+        return True
     except:
         output('[ERROR] Logger failed to send message to Unix SysLog!')
         sys.exc_info()
@@ -1540,21 +1641,25 @@ def create_sidecar_hash_file(filename_being_hashed, buf_to_hash, hash_file_name)
         error('Hashed file buffer not specified')
         return False
     if path_exists(hash_file_name):
-        error('Hash sidecar file already exists, not overwriting')
+        error('Hash sidecar file already exists! Not overwriting')
         return False
-    # XXX what about hashing an empty file, valid?
     try:
-        ign = warn_if_overwriting_file('', hash_file_name)
+        # _ign = warn_if_overwriting_file('create_sidecar_hash_file', hash_file_name)
         hash_buf = hash_sha256_buffer(buf_to_hash)
+        if is_none_or_null(hash_buf):
+            error('create_sidecar_hash_file(): hash_buf is null or none')
+            return False
         hash_file = open(hash_file_name, 'w')
-
         debug('create_sidecar_hash_file(): hash_file_name = ' + hash_file_name)
         debug('create_sidecar_hash_file(): hash_buf = ' + hash_buf)
         debug('create_sidecar_hash_file(): buf_to_hash = ' + buf_to_hash)
-
-        hash_file.write(filename_being_hashed + ' ' + hash_buf)
+        # sha256sum file format: <hash> + <space> + <filename>
+        # XXX what about dirs? OS-specific path separators? escaping paths with spaces and other punct?
+        # XXX what tools do Windows users use, certutil.exe, ...? what formats do they expect?
+        # XXX Maybe add --hash_format=<toolname>, where <toolname> is sha256sum, certutil, ...
+        hash_file.write(hash_buf + ' ' + filename_being_hashed)  # XXX newline?
         hash_file.close()
-    except OSError as e:
+    except OSError:
         sys.exc_info()
         error('Problems creating sidecar hash file')
         return False
@@ -1564,21 +1669,26 @@ def create_sidecar_hash_file(filename_being_hashed, buf_to_hash, hash_file_name)
 def create_hash_file(input_ascii_file, ascii_file_hash_file):
     '''Create a hash file.
 
-    Returns True if file was written, False if failed.
+    input_ascii_file -- input filename
+    ascii_file_hash_file -- output filename
 
-    input_ascii_file -- XXX
-    ascii_file_hash_file -- XX
+    Returns True if file was written, False if failed.
     '''
     if input_ascii_file is None:
-        error('unable to generate hash, no file provided')
+        error('Unable to generate hash file, no input filename provided')
+        return False
+    if ascii_file_hash_file is None:
+        error('Unable to generate hash file, no output filename provided')
         return False
     _ = warn_if_overwriting_file('create_hash_file', ascii_file_hash_file)
     try:
         digest_string = hash_sha256_file(input_ascii_file)
+        debug('create_hash_file: hash=' + digest_string + ', filename=' + ascii_file_hash_file)
         with open(ascii_file_hash_file, 'wt') as f:
             f.write(digest_string)
         return True
     except:
+        error('Unable to generate hash file, unexpected exception')
         sys.exc_info()
         return False
 
@@ -1594,8 +1704,8 @@ def hash_sha256_file(filename, use_hex_dig=True):
     '''
     try:
         file_size_bytes = os.path.getsize(filename)
-        info('File to be hashed: ' + filename)
-        info('File size (bytes) to be hashed: ' + str(file_size_bytes))
+        debug('File name to be hashed: ' + filename)
+        debug('File size (bytes) to be hashed: ' + str(file_size_bytes))
         with open(filename, 'rb') as f:
             buf = f.read()
             # XXX decode('utf-8')
@@ -1638,6 +1748,7 @@ def hash_sha256_buffer(buf, use_hex_dig=True, use_base64_bin_dig=False):
 
 
 def show_tools_and_profiles():
+    '''TBW.'''
     if app_state['user_tools'] is None:
         error('user_tools is None')
     if app_state['user_profiles'] is None:
@@ -1651,7 +1762,7 @@ def show_tools_and_profiles():
     app_state['tools_and_profiles'] = app_state['user_tools']
 
 
-def list_profile_list(profiles, profile_name, verbose=False):
+def list_profile_list(profiles, profile_name):
     '''List one profile list, the built-in or user-defined one(s).'''
     # XXX cleanup output, add column alignment
     if profile_name is None:
@@ -1686,19 +1797,65 @@ def list_profiles():
     else:
         list_profile_list(PROFILES, 'built-in')
     new_profiles = app_state['new_profiles']
-    if ((new_profiles is not None) and (new_profiles is not '')):
+    if (new_profiles is not None) and (new_profiles is not ''):
         # XXX untested codepath
         list_profile_list(new_profiles, 'user-defined')
 
 
-def list_tools(verbose=False):
+def list_tools():
     '''User specified --list_tools, list available tools.'''
     log('Available tool count: ' + str(len(TOOLS)))
     # XXX cleanup output, add column alignment
     for i, tool in enumerate(TOOLS):
-        # XXX cleanup output, add column alignment
         msg = tool['name'] + ':  ' + tool['desc']
         log(msg, prefix=str(i) + '  ', suffix='')
+
+
+def get_tool_arg(toolns, key):
+    '''Return argument of a tool, given a toolns.
+
+    TOOLS['chipsec_iommu_engine']['args'] = args.chipsec_iommu_engine
+    TOOLS['chipsec_util_spi_dump']['args'] = args.chipsec_rom_bin_file
+    value = get_tool_arg(toolns, key)
+    Remove this once I can figure out how to use Python dictionaries properly.
+    '''
+    # arg_value = TOOLS[tool_ns]['args'][arg_key]
+    # debug('toolns=' + tool_ns + ', arg_key=' + arg_key + 'arg_value=' + arg_value)
+    # XXX need to add key after args!!
+    if is_none_or_null(toolns):
+        error('Tool namespace not specified')
+        return None
+    if not is_valid_tool(toolns):
+        error('Invalid tool namespace: ' + toolns)
+        return None
+#    for t in TOOLS:
+#        tool_name = t['tool']
+#        ns = t['name']
+#        tool_args = t['args']
+#        if not isinstance(expected_rc, int):
+#            error('Expected RC is not an Integer')
+#            return (None, None)
+#        if toolns == ns:
+#            debug('SUCCESS, valid tool ' + tool_name + ', args= ' + str(tool_args))
+#            return tool_args
+#    error('Invalid toolns: ' + toolns)
+    # Traverse TOOLS list, finding toolns entry.
+    for i, t in enumerate(TOOLS):
+        #tool_name = t['tool']
+        tool_ns = t['name']
+        tool_args = t['args']
+        #tool_expected_rc = t['exrc']
+        if tool_ns == toolns:
+            # debug('Valid tool ' + tool_ns)
+            try:
+                value = tool_args[key]
+                debug('Toolns=' + toolns + ', key=' + key + ', value=' + value)
+                return value
+            except KeyError:
+                debug('KeyError exception, key not valid: ' + key)
+                return None
+            debug('Tool not found!')
+    return None
 
 
 def set_tool_arg(toolns, key, value):
@@ -1719,22 +1876,22 @@ def set_tool_arg(toolns, key, value):
         error('No tool name specified, cannot lookup arg value')
         return False
     for i, t in enumerate(TOOLS):
-        ns = t['name']
-        args = t['args']
-        if ns != toolns:
-            debug('Valid tool ' + toolns)
+        tool_ns = t['name']
+        tool_args = t['args']
+        if tool_ns != toolns:
+            debug('Valid tool ' + tool_ns)
             try:
-                value = args[key]
+                value = tool_args[key]
                 debug('Toolns=' + toolns + ', key=' + key + ', value=' + value)
                 return value
             except KeyError:
                 debug('KeyError exception, key not valid: ' + key)
                 return None
-    debug('FAILURE, invalid tool ' + toolns)
+    error('Invalid tool ' + toolns)
     return None
 
 
-def is_valid_tool(lookup_name, verbose=False):
+def is_valid_tool(lookup_name):
     '''
     Is specified lookup_name a valid tool name?
 
@@ -1745,11 +1902,12 @@ def is_valid_tool(lookup_name, verbose=False):
     Returns True if valid, False if not.
     '''
     for i, t in enumerate(TOOLS):
-        tool_name = t['name']
-        if tool_name == lookup_name:
-            # debug('Tool is valid: ' + tool_name)
+        tool_ns = t['name']
+        # debug('is_valid_tool(): tool_name = ' + tool_ns)
+        if tool_ns == lookup_name:
+            # debug('Valid tool ' + lookup_name)
             return True
-    warning('Invalid tool: ' + tool_name)
+    error('Invalid tool ' + lookup_name)
     return False
 
 
@@ -1792,6 +1950,7 @@ def is_valid_profile(lookup_profile,
     return False
 
 #####################################################################
+
 
 # run.py
 #
@@ -1956,7 +2115,7 @@ def spawn_process(args, start_dir, expected_rc, toolns,
         error('Unknown output mode: ' + mode)
         return -6
 
-    info('pre-exec: tool="' + args[0] + '", ns="' + toolns + '", cwd="' + start_dir + '"')
+    debug('pre-exec: tool="' + args[0] + '", ns="' + toolns + '", cwd="' + start_dir + '"')
     try:
         # XXX use Popen(bufsiz=x, executable=x,
         if is_none_or_null(start_dir):
@@ -1993,7 +2152,7 @@ def spawn_process(args, start_dir, expected_rc, toolns,
                     ', err=' + str(len(stderr_buf)))
         else:
             status_string = 'PASS'
-            info(status_string + ': ' +
+            debug(status_string + ': ' +
                  'post-exec: ' +
                  'rc=' + str(process.returncode) +
                  ', erc=' + str(expected_rc) +
@@ -2015,7 +2174,7 @@ def spawn_process(args, start_dir, expected_rc, toolns,
         # XXX add hashes to results
         debug('Logging exec results to eventlog')
         log_exec_results(args, toolns, process.returncode, status_string)
-    elif app_state['syslog_mode']:
+    if app_state['syslog_mode']:
         # XXX add hashes to results
         debug('Logging exec results to syslog')
         log_exec_results(args, toolns, process.returncode, status_string)
@@ -2152,27 +2311,16 @@ def show_tool_stdio(start_dir, toolns, stdout_buf, stderr_buf, show_stdio, log_s
                 return False
 
         if log_stdio:
-            debug('Logging stdout to syslog..')
+            # debug('Logging stdout to syslog..')
             if not is_none_or_null(stdout_buf):
                 log_stdio_func(stdout_buf, stdout_file)
             if mode != 'merged':
                 if not is_none_or_null(stderr_buf):
                     log_stdio_func(stderr_file, stderr_buf, stderr_file)
 
-        if hash_stdio:
-            debug('Creating sidecar hash files for output file(s)..')
-            if not is_none_or_null(stdout_buf):
-                create_sidecar_hash_file(stdout_file, stdout_buf,
-                                         stdout_file + '.sha256')
-            if mode != 'merged':
-                if not is_none_or_null(stderr_buf):
-                    create_sidecar_hash_file(stderr_buf,
-                                             stderr_file + '.sha256')
-
     except OSError as e:
         sys.exc_info()
         error('Unexpected exception occurred')
-    debug('***** Exiting show_tool_stdio()')  # XXX
     return True
 
 #####################################################################
@@ -2203,9 +2351,9 @@ def log_exec_results(args, toolns, rc, status_string):
     log_msg = our_name + ': status=' + status_string + ': test=' + toolns + ', rc=' + str(rc)
 #        'sha256=' + sha256_hash
     debug('syslog/eventlog message: ' + log_msg)
-#    if app_state['eventlog_mode']:
-#        debug('Logging exec results to Windows EventLog..')
-#        eventlog_send(log_msg)
+    if app_state['eventlog_mode']:
+        debug('Logging exec results to Windows EventLog..')
+        eventlog_send(log_msg)
     if app_state['syslog_mode']:
         debug('Logging exec results to UNIX SysLog..')
         syslog_send(log_msg)
@@ -2289,11 +2437,278 @@ def traverse_dir(dirname):
     # debug('Successfully walked directory, returning actual data')
     return (True, dirs, files, total_bytes)
 
-
 #######################################
 
 
-def build_meta_profile(verbose=False):
+def get_parent_directory_name():
+    '''Get the name of the Parent Directory (PD).
+
+    Sets app_state['output_dir'], if user has not already specified an directory
+    via --output_dir. On Unix, when sudo used, dir is changed from root-based to
+    pre-sudo user-based.
+
+    Return True if successful, False if there was a problem.'''
+    # XXX Does upstream code test if dir does not exist, and create or fail?
+    if app_state['output_dir_specified']:
+        debug('User specified output dir')
+        _dir = app_state['output_dir']
+        if is_none_or_null(_dir):
+            error('User-specified parent directory is empty')
+            return False
+    else:
+        _dir = get_default_directory_name()
+        if is_none_or_null(_dir):
+            error('Directory is null')
+            return False
+        # Note: returned path has trailing path separator (/, \)!
+        app_state['output_dir'] = _dir + 'fwaudit.results'
+    debug('Output parent directory: ' + app_state['output_dir'])
+    return True
+
+def get_default_directory_name():
+    '''Get the name of the directory where the Parent Directory is.
+
+    Get the OS-centric directory name where the 'Parent Directory' (PD) is located.
+    Note: Downstream code presumes trailing path separator.
+
+    Return string of dir, or None if failure.'''
+    _dir = None
+    if os_is_unix():
+        if app_state['sudo_based_usage']:
+            try:
+                _sudo_user = os.getenv('SUDO_USER')
+                if is_none_or_null(_sudo_user):
+                    error('SUDO_USER environment variable is null')
+                    return None
+                _dir = '/home/' + _sudo_user + '/'
+                #debug('Parent Dir (updated for SUDO usage) = ' + _dir)
+            except:
+                error('Unable to get SUDO user home directory')
+                sys.exc_info()
+                return None
+        else:
+            try:
+                _dir = os.environ['HOME']
+                _dir = _dir + '/'
+                #debug('Parent Dir (NOT updated for SUDO usage) = ' + _dir)
+            except:
+                error('Unable to get HOME environment variable')
+                sys.exc_info()
+                _dir = None
+            if is_none_or_null(_dir):
+                error('HOME environment variable is empty')
+                _dir = None
+    elif os_is_windows():
+        debug('Getting dir of Windows system')
+        _dir = '%APPDATA%\\Roaming\\'  # XXX untested codepath!
+    elif os_is_uefi():
+        debug('Getting dir of UEFI Shell system')
+        _dir = 'fs0:\\'  # XXX untested codepath!
+    else:
+        error('Unsupported target OS')
+        _dir = None
+    if is_none_or_null(_dir):
+        error('Generated home directory is null')
+    return _dir
+
+
+def sudo_user_diags():
+    '''For Unix SUDO use case, get pre-SUDO username.'''
+    # What is FSB/POSIX standard for '/home/' + username?
+    # win32api: GetUserName() and GetUserNameEx()
+    # Is root always 0 (EUID==0?) on all modern *nix systems?
+    # How to deal with Linux Capabilities?
+    # How to deal with SELinux?
+    # How to deal with Linux ACLs?
+    # How to deal with BSD...?
+    try:
+        sudo_user = os.getenv('SUDO_USER')
+        debug('getenv(SUDO_USER) username: ' + sudo_user)
+        sudouser_home_dir = '/home/' + sudo_user
+        debug('Homedir = ' + sudouser_home_dir)
+    except:
+        debug('Unable to view SUDO_USER')
+    user = os.getenv('USER')
+    logname_username = os.getenv('LOGNAME')
+    # username = pwd.getpwuid(os.geteuid()).pw_name
+    pwname_username = pwd.getpwuid(os.getuid()).pw_name
+    username = getpass.getuser()
+    userhome = os.path.expanduser('~')
+    debug('getenv(LOGNAME) username: ' + logname_username)
+    debug('pwd.getpwuid.pw_name: ' + pwname_username)
+    debug('getpass.getuser() username: ' + username)
+    debug('expanduser(~) home dir: ' + userhome)
+    debug('getenv(USER) username: ' + user)
+    logname_home_dir = os.path.expanduser('~' + logname_username + '/')
+    debug('Homedir = ' + logname_home_dir)
+    pwname_home_dir = os.path.expanduser('~' + pwname_username + '/')
+    debug('Homedir = ' + pwname_home_dir)
+
+
+def set_groups(path, new_uid, new_gid, verbose=False):
+    '''For sudo case, set GID to non-SuperUser value.'''
+    if not app_state['sudo_based_usage']:
+        debug('set_groups: called for non-sudo use')
+        return False
+    try:
+        debug('Changing file owner: file=' + path + ', uid=' + str(new_uid))
+        new_gid_list = []
+        new_gid_list = os.getgroups()
+        if verbose:
+            debug('os.getgroups: new_gid_list: ' + str(new_gid_list))
+        os.setgroups([])
+        if verbose:
+            debug('calling os.setgroups(' + str(new_gid_list) + ')..')
+        os.setgroups(new_gid_list)
+        if verbose:
+            debug('calling os.setgid(' + str(new_gid) + ')..')
+        os.setgid(new_gid)
+    except OSError as e:
+        sys.exc_info()
+        error('Unable to to update UID on file: ' + path)
+        log('Exception ' + str(e.errno) + ': ' + str(e))
+        return False
+    return True
+
+
+def set_owner(path, new_uid, new_gid):
+    '''For sudo case, set UID to non-SuperUser value.'''
+    if not app_state['sudo_based_usage']:
+        debug('set_owner: called for non-sudo use')
+        return False
+    try:
+        debug('Changing file owner: file=' + path + ', uid=' + str(new_uid))
+        os.chown(path, new_uid, new_gid)
+    except OSError as e:
+        sys.exc_info()
+        debug('Unable to update GID on file: ' + path)  # XXX error()
+        debug('Exception ' + str(e.errno) + ': ' + str(e))  # XXX log()
+        return False
+    return True
+
+
+def change_file_owner_group(path, new_uid, new_gid):
+    '''For Unix SUDO use case, modify existing root-owned file to pre-SUDO user.'''
+    if not app_state['sudo_based_usage']:
+        debug('set_owner: called for non-sudo use')
+        return True
+    if path is None:
+        error('No path specified')
+        return False
+    if new_uid is None:
+        error('No UID specified')
+        return False
+    if new_gid is None:
+        error('No GID specified')
+        return False
+    debug('Changing file owner/group/mode: ' + path + ',' + str(new_uid) + ', ' + str(new_gid))
+    owner_status = set_owner(path, new_uid, new_gid)
+    group_status = set_groups(path, new_uid, new_gid)
+    if (not owner_status) or (not group_status):
+        debug('Unable to set file ownership/group')  # XXX error()
+        return False
+    return True
+
+
+def change_file_mode(path, new_mode):
+    '''For Unix SUDO use case, modify existing file attributes.'''
+    # XXX how to determine which to set, user or sudo?
+    if not app_state['sudo_based_usage']:
+        debug('Not updating file mode, not using sudo')
+        return True
+    if path is None:
+        error('No path specified')
+        return False
+    if new_mode is None:
+        error('No file mode specified')
+        return False
+    try:
+        os.chmod(path, new_mode)
+    except OSError as e:
+        sys.exc_info()
+        debug('Unable to modify mode on path: ' + path)  # XXX error()
+        debug('ERROR: Exception ' + str(e.errno) + ': ' + str(e))  # XXX log()
+        return False
+    return True
+
+
+def change_generated_file_perms(path, verbose=False):
+    '''Change file ownership of a sudo-created file to it's non-root user.
+
+    After the tools have been run, traverse the per-run-directory (PRD)
+    and update all the files that the tools have generated, fixing the
+    file ownerships from sudo'ed 'root' to the actual user, so the user
+    can view the resulting files w/o having to become superuser.
+    Eg: change_owner_and_attributes("rom.bin", "nobody", "nogroup", 436)
+
+    Returns 0 if successful, 1 if an error occurred.'''
+    if not app_state['sudo_based_usage']:
+        debug('Not updating file owner/group/mode, not using sudo')
+        return True
+    if not os_is_unix():
+        error('Only for UNIX-style OSes')
+        return False
+    cur_uid = os.getuid()
+    if cur_uid != 0:
+        error('UID nonzero: User is not SuperUser')
+        return False
+    debug('current UID: ' + str(cur_uid))
+    cur_euid = os.geteuid()
+    if cur_euid != 0:
+        error('EUID nonzero: User is not SuperUser')
+        return False
+    debug('current EUID: ' + str(cur_euid))
+    if path is None:
+        error('Must specify path to set')
+        return False
+
+    # XXX This whole section: duplicate code, use existing function
+    new_uid = int(os.environ.get('SUDO_UID'))
+    if new_uid is None:
+        error('Unable to obtain SUDO_UID')
+        return False
+    new_gid = int(os.environ.get('SUDO_GID'))
+    if new_gid is None:
+        error('Unable to obtain SUDO_GID')
+        return False
+    # XXX Read-only works for FILE, but need Write support for DIRs.
+    # new_mode = ( stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH )
+    # new_mode = stat.S_IREAD | stat.S_IRUSR | stat.S_IRGRP
+    r_mode = (stat.S_IRUSR|stat.S_IRGRP|stat.S_IROTH)
+    rw_mode = (stat.S_IRUSR|stat.S_IWUSR|stat.S_IRGRP|stat.S_IWGRP|stat.S_IROTH|stat.S_IWOTH)
+    rwx_mode = (stat.S_IRWXU|stat.S_IRWXG|stat.S_IRWXO) 
+    new_dir_mode = rwx_mode
+    new_file_mode = rwx_mode
+    if verbose:
+        debug('new file mode: ' + str(new_file_mode))
+    if verbose:
+        debug('new dir mode: ' + str(new_dir_mode))
+
+    for root, dirs, files in os.walk(path):  
+        if verbose:
+            debug('root dir = ' + root)
+        for d in dirs:  
+            if verbose:
+                debug('dir = ' + d)
+            joined = os.path.join(path, d)
+            if verbose:
+                debug('joined dir = ' + joined)
+            change_file_owner_group(joined, int(new_uid), int(new_gid))
+            change_file_mode(joined, int(new_dir_mode))
+
+        for f in files:
+            if verbose:
+                debug('file = ' + f)
+            joined = os.path.join(path, f)
+            if verbose:
+                debug('joined file = ' + joined)
+            change_file_owner_group(joined, int(new_uid), int(new_gid))
+            change_file_mode(joined, int(new_dir_mode))
+    # XXX propogate status code upstream
+    return True
+
+
+def build_meta_profile(verbose=True):
     '''Build meta profile, a list of all selected tools to run.
 
     Given the input app_state['user_tools'] and app_state['user_profiles'],
@@ -2318,24 +2733,25 @@ def build_meta_profile(verbose=False):
     skipped -- count of selected unrecognized tools skipped.
     '''
     # XXX check for duplicate tool entries, warn and skip dups
+    # XXX can also check for dup tools when creating ptd, check if already exists.
+    # XXX Remove verbose arg, or at least sync with global.
     app_state['meta_profile'] = []
     tools = 0
     skipped = 0
-    if ((app_state['user_profiles'] is None) and
-       (app_state['user_tools'] is None)):
-        error('No profile(s) and/or tool(s) selected')
+    if (app_state['user_profiles'] is None) and (app_state['user_tools'] is None):
+        error('No profile(s) or tool(s) selected, nothing to do')
         return (False, tools, skipped)
-    if ((app_state['no_profile']) and (app_state['new_profiles'] is None)):
-        error('No profiles, built-in disabled, no user-defined provided')
-        return (False, tools, skipped)
+    if (app_state['no_profile']) and (app_state['new_profiles'] is None):
+        warning('Profiles are disabled')
+        # XXX this codepath previously returned False. Does any below code presume the previous return?
 
-    # if verbose: debug('Enumerating user selected tool(s) list..')
+    # Enumerate user selected tool(s) list.
     if app_state['user_tools'] is not None:
-        # if verbose: output_wrapped(app_state['user_tools'])
+        if verbose:
+            output_wrapped(app_state['user_tools'])
         for t in app_state['user_tools']:
-            # if verbose: debug('build_metaprofile(): tool, type(t): ' + str(type(t)))
             if is_valid_tool(t):
-                # if verbose: debug('Adding tool to meta_profile: ' + t)
+                debug('Adding tool to meta_profile: ' + t)
                 app_state['meta_profile'].append(t)
                 tools += 1
             else:
@@ -2343,11 +2759,11 @@ def build_meta_profile(verbose=False):
                 skipped += 1
                 # return False   XXX?
 
-    # debug('Enumerating user-selected profile(s) list..')
+    # Enumerate user-selected profile(s) list.
     if app_state['user_profiles'] is not None:
         output_wrapped(app_state['user_profiles'])
         if app_state['no_profile']:
-            # debug('Examining user-defined profiles')
+            debug('Examining user-defined profiles')
             for p in app_state['user_profiles']:
                 debug('User profile: ' + str(type(p['name'])))  # XXX
                 debug('User profile: ' + p['name'])
@@ -2363,46 +2779,68 @@ def build_meta_profile(verbose=False):
                             warning('Ignoring unrecognized tool: ' + str(t))
                             # return False   XXX?
         else:
-            # if verbose: info('Examining built-in profiles')
+            info('Examining built-in profiles')
             # for p in enumerate(app_state['user_profiles']):
             for p in app_state['user_profiles']:
-                # if verbose: info('Profile: ' + str(type(p['name'])))
-                # info('Profile: ' + p['name'])
+                if verbose:
+                    info('Profile: ' + str(type(p['name'])))
+                info('Profile: ' + p['name'])
                 if p in enumerate(PROFILES):  # XXX .keys()?
-                    # if verbose: info('Matches profile: ' + p['name'])
+                    if verbose:
+                        info('Matches profile: ' + p['name'])
                     for t in enumerate(p['tools']):
                         if is_valid_tool(t):
-                            # if verbose: info('Adding tool to meta_profile: ' + t)
+                            if verbose:
+                                info('Adding tool to meta_profile: ' + t)
                             tools += 1
                             app_state['meta_profile'].append(t)
                         else:
+                            skipped += 1
                             warning('Ignoring unrecognized tool: ' + str(t))
                             # return False   XXX?
 
-    # debug('Tool count: ' + str(tools))
+    debug('Tool count: ' + str(tools))
+    debug('Skipped count: ' + str(skipped))
     if skipped > 0:
         warning('Total skipped tool count: ' + str(skipped))
     return (True, tools, skipped)
 
 
 def create_directories():
-    '''Setup PD and PTD, return True if successful, False if not.'''
+    '''Setup PD and PTD, including dealing with SUDO root -vs- user dir.
+
+    Return True if successful, False if not.'''
+
+    (new_dir_mode, new_uid, new_gid) = get_sudo_user_group_mode()
+
+    # Part 1 of 3:
     # Setup Parent Directory (PD), before referencing PRD or PTD.
-    if setup_parent_directory() is False:
+    # Get the name of PD
+    _dir = get_parent_directory_name()
+    if is_none_or_null(_dir):
+        error('Parent directory name unspecified')
+        return False, None, None
+    # Create PD
+    if setup_parent_directory(new_dir_mode, new_uid, new_gid) is False:
         error('Cannot create parent directory (PD), exiting')
         return False, None, None
     pd = app_state['output_dir']
     # debug('PD setup: ' + pd)
+
+    # Part 2 of 3:
     # Setup Per-Run Directory (PRD), after PD is setup, before PTDs used.
-    if not setup_per_run_directory(pd):
+    if not setup_per_run_directory(pd, new_dir_mode, new_uid, new_gid):
         error('Cannot create per-run directory (PRD), exiting')
         return False, None, None
     prd = app_state['per_run_directory']
     # debug('PRD setup: ' + prd)
+
+    # Part 3 of 3: the Per-Tool-Directories (PTDs), happens elsewhere.
+
     return True, pd, prd
 
 
-def setup_per_run_directory(pd):
+def setup_per_run_directory(pd, new_dir_mode, new_uid, new_gid):
     '''Create the per-run directory, if it doesn't already exist.
 
     Must be called after Parent Directory (PD) has been created.
@@ -2410,16 +2848,13 @@ def setup_per_run_directory(pd):
 
     Returns True if successful, False if not.
     '''
-    # t = datetime.datetime.today()
-    # timestamp = datetime.datetime.now.strftime('%Y%m%d_%H%M%S_%f')
+    # XXX UCT timezone usage
+    stamp_format = '%Y%m%d%H%M%S' # '%Y%m%d_%H%M%S_%f'
     ts = time.gmtime()
-    timestamp = time.strftime('%Y%m%d%H%M%S', ts)
-    # debug('timestamp = ' + timestamp)
+    timestamp = time.strftime(stamp_format, ts)
     app_state['timestamp'] = timestamp
     prd = os.path.join(pd, timestamp)
-    # debug('prd name = ' + prd)
     os.mkdir(prd)
-    # debug('post-mkdir, prd name = ' + prd)
     if is_none_or_null(prd):
         error('Per-run directory name unspecified')
         return False
@@ -2427,56 +2862,109 @@ def setup_per_run_directory(pd):
         error('Per-run directory does not exist: ' + prd)
         return False
     app_state['per_run_directory'] = prd
-    # debug('Per-Run Directory: ' + prd)
+    debug('Per-run-directory: ' + prd)
+    if app_state['sudo_based_usage']:
+        debug('Changing owner/group of PRD...')
+        change_file_owner_group(prd, new_uid, new_gid)
+        debug('Changing attribs of PRD...')
+        change_file_mode(prd, new_dir_mode)
     return True
 
 
-def setup_parent_directory():
+def get_sudo_user_group_mode():
+    '''TBW'''
+    # XXX only need uid, gid, and file mode for sudo case...
+    new_uid = int(os.environ.get('SUDO_UID'))
+    if new_uid is None:
+        error('Unable to obtain SUDO_UID')
+        return False
+    #debug('new UID via SUDO_UID: ' + str(new_uid))
+    new_gid = int(os.environ.get('SUDO_GID'))
+    if new_gid is None:
+        error('Unable to obtain SUDO_GID')
+        return False
+    #debug('new GID via SUDO_GID: ' + str(new_gid))
+    # new_dir_mode = (stat.S_IRUSR|stat.S_IWUSR|stat.S_IRGRP|stat.S_IWGRP|stat.S_IROTH|stat.S_IWOTH)
+    rwx_mode = (stat.S_IRWXU|stat.S_IRWXG|stat.S_IRWXO)
+    new_dir_mode = rwx_mode
+    #debug('new dir mode: ' + str(new_dir_mode))
+    return (new_dir_mode, new_uid, new_gid)
+
+
+def setup_per_tool_directory(pd, prd, ptd, toolns):
+    '''Create the per-tool directory.'''
+    if is_none_or_null(ptd):
+        error('Per-tool-directory name unspecified')
+        return False
+    if dir_exists(ptd):
+        if not is_dir_empty(ptd):
+            error('Skipping non-empty per-tool-directory: ' + ptd)
+            return False
+        warning('Using existing empty per-tool directory: ' + ptd)
+    else:
+        try:
+            os.mkdir(ptd)
+            if not dir_exists(ptd):
+                error('Problems creating per-tool-directory')
+                return False
+        except OSError:
+            sys.exc_info()
+            error('Problems creating per-tool-directory')
+            return False
+
+    (new_dir_mode, new_uid, new_gid) = get_sudo_user_group_mode()
+    change_file_owner_group(ptd, new_uid, new_gid)
+    change_file_mode(ptd, new_dir_mode)
+    if not dir_exists(ptd):
+        error('Target per-tool directory was not created: ' + ptd)
+        return False
+    return True
+
+
+def setup_parent_directory(new_dir_mode, new_uid, new_gid):
     '''Create the parent directory, if it doesn't already exist.
 
     Must be called before any use of the Per-Run Directory (PRD)
     or the Per-Tool Directory (PTD) of each toolns.
 
-    Presumes all UNIX systems use HOME to store pointer to ~.
-    If this is not the case, need a more portable method.
+    If Unix user has used SUDO to become SuperUser, then the 
+    PD must be changed from default root-based to original user-based,
+    so after SUDO command, the resulting files are in the user's 
+    subdir, not in the root dir.
+
+    If user specifies their own PD, then should not modify location.
+
+    What to do if user foo has an existing PD, and ALSO the root
+    has an existing PD? Two users separately using fwaudit, two
+    separate datasets. Warn? Merge? How to fail properly?
 
     Returns True if successful, False if not.
     '''
-    # XXX Add UEFI codepath
-    if is_none_or_null(app_state['output_dir']):
-        if os_is_unix():
-            home = get_user_home_directory()
-            default_unix_parent_dir = home + '/fwaudit.results'
-            app_state['output_dir'] = default_unix_parent_dir
-        elif os_is_windows():
-            # XXX untested codepath
-            default_windows_parent_dir = '%APPDATA%\\fwaudit.results'
-            app_state['output_dir'] = default_windows_parent_dir
-        else:
-            error('Not Windows or Unix, untested codepath, please patch')
-            return False
     pd = app_state['output_dir']
     if is_none_or_null(pd):
         error('Parent directory name unspecified')
         return False
-    if not dir_exists(pd):
-        # debug('Creating parent directory: ' + pd)
-        try:
-            pd = os.mkdir(pd)
-            if not dir_exists(pd):
-                error('Problems creating parent directory')
-                return False
-        except OSError as e:
-            sys.exc_info()
-            error('PD: OSError exception occurred')
+    # By now, PD string should exist. Create dir, if it doesn't already exist.
+    if dir_exists(pd):
+        debug('Parent directory already exists: ' + pd)
+        return True
+    debug('Parent directory does not exist, creating: ' + pd)
+    try:
+        os.mkdir(pd)
+        if not dir_exists(pd):
             error('Problems creating parent directory')
             return False
-    else:
-        # debug('Parent directory already exists: ' + pd)
-        return True
-    # debug('Parent Directory created: ' + pd)
-    return True
+    except OSError as e:
+        sys.exc_info()
+        error('Problems creating parent directory')
+        return False
 
+    # XXX only do this if using sudo codepath
+    debug('Updating owner/attribs of Parent Directory')
+    change_file_owner_group(pd, new_uid, new_gid)
+    change_file_mode(pd, new_dir_mode)
+
+    return True
 
 def run_meta_profile(pd, prd):
     '''Loop through and run each of the tools in the meta_profile.'''
@@ -2489,69 +2977,49 @@ def run_meta_profile(pd, prd):
         # return False
     pd = app_state['output_dir']
     prd = app_state['per_run_directory']
-
-    # debug('PD type: ' + str(type(pd)))
-    # debug('PRD type: ' + str(type(prd)))
-    # debug('PD: ' + pd)
-    # debug('PRD: ' + prd)
-
     if is_none_or_null(pd):
         error('Unable to obtain PD')
         return False
     if is_none_or_null(prd):
         error('Unable to obtain PRD')
         return False
-
+    # For each tool to run, create it's target per-tool-directory.
     for toolns in app_state['meta_profile']:
-        # debug('run_meta_profile(): Toolns: ' + toolns)
         try:
-            # Dir tree layout: PD/PRD/PTD
-            # PD is --output_dir value, or ~/fwaudit.data.
-            # PRD is timestamp of current run.
-            # PTD is toolns string
-            # debug('toolns=' + toolns)
-            # debug('prd=' + prd)
             ptd = os.path.join(prd, toolns)
-            # Now PTD path string is built, but have not created dir yet,
-            # Check if dir already exists, if so is empty or not.
-            # Fail if non-empty, warn but use an empty directory,
-            # instead of creating it ourselves. Maybe user created it for us?
-            # debug('Per-Tool-Directory name: ' + ptd)
-            if dir_exists(ptd):
-                warning('Per-tool directory already exists: ' + ptd)
+            if not setup_per_tool_directory(pd, prd, ptd, toolns):
+                error('Unable to create per-tool-directory')
                 return False
-                # if not is_dir_empty(ptd):
-                #    error('Target per-tool directory is non-empty: ' + ptd)
-                #    return False
-                # warning('Reusing existing  empty directory: + ' + ptd)
             else:
-                # debug('Creating PTD directory: ' + ptd)
-                os.mkdir(ptd)
-            if not dir_exists(ptd):
-                error('Target per-tool directory was not created')
-                return False
-            # debug('PTD: ' + ptd)
-
+                debug('Created per-tool directory: ' + ptd)
             # At this point, we should have a PRD/PTD dir setup to run tool in.
         except OSError as e:
-            sys.exc_info()  # XXX this stopped working, why?
-            # FIXME: check if OSError is File Not Found
+            sys.exc_info()
+            # XXX: check if OSError is File Not Found
             # except FileNotFoundError as e:
             # error('File Not Found: tool needs to be installed in PATH')
             error('OSError trying to create tool directory')
             return False
+        # Call tool resolver, to determine which variation (namespace) of a tool to run
+        rc = tool_resolver(toolns, pd, prd, ptd)
+        # XXX Confirm failure rc is logged in tool_resolver() or finish_results()
+        debug('Post-tool-resolution, rc = ' + str(rc))
 
-    # debug('Done changing/checking/making dirs, calling resolver..')
-    # Call tool resolver, which requires the above-created PTD.
-    rc = tool_resolver(toolns, pd, prd, ptd)
-    # XXX Confirm failure rc is logged in tool_resolver() or finish_results()
-    debug('Post-tool-resolution, rc = ' + str(rc))
+    if app_state['hash_mode']:
+        if not create_sidecar_hash_files(ptd):
+            error('Unable to create side-car hash file(s) in PTD directory: ' + ptd)
+            return False
+    if app_state['manifest_mode']:
+        if not create_manifest_file(ptd):
+            error('Unable to create PTD manifest file in directory: ' + ptd)
+            return False
     # finish_results()
+    # XXX propogate error upstream
     return True
 
 
 def get_pass_fail_status(toolns, tool, rc, erc):
-    info('Expected_rc=' + str(erc) + ', rc=' + str(rc))
+    debug('Expected_rc=' + str(erc) + ', rc=' + str(rc))
     erc = rc  # XXX mock sucess, fix properly!
     if rc == erc:
         status = 'PASS'
@@ -2600,7 +3068,6 @@ def tool_resolver(toolns, pr, prd, ptd):
     # load), then alphabetize
     # XXX resolve acpidump live output not working as acpixtract offline input.
     rc = 1
-    # debug('RC = ' + str(rc))
     if is_none_or_null(prd):
         error('No per-run directory specified')
         return rc
@@ -2631,19 +3098,11 @@ def tool_resolver(toolns, pr, prd, ptd):
         error('Expected rc is None or non-Integer')
         return rc
 
-    # debug('********** Resolving tool..')
-    # debug('    toolns: ' + toolns)
-    # debug('    tool: ' + tool)
-    # debug('    expected_rc: ' + str(erc))
-    # debug('    per-run dir: ' + prd)
-    # debug('    per-tool dir: ' + ptd)
-
     if tool == 'acpidump':
         rc = acpidump(toolns, tool, prd, ptd, erc)
     elif tool == 'acpixtract':
         rc = acpixtract(toolns, tool, prd, ptd, erc)
     elif ((tool == 'chipsec') or (tool == 'chipsec_util') or (tool == 'chipsec_main')):
-        debug('calling chipsec resolver..')
         rc = chipsec(toolns, tool, prd, ptd, erc)
     elif tool == 'dmidecode':
         rc = dmidecode(toolns, tool, prd, ptd, erc)
@@ -2664,16 +3123,16 @@ def tool_resolver(toolns, pr, prd, ptd):
         return -1  # XXX ?
     debug(tool + ' post-exec: rc=' + str(rc) + ', expected=' + str(erc))
     status = get_pass_fail_status(toolns, tool, rc, erc)
+
     # add_results_record(tool, ptd, toolns, rc, erc, status)
     # XXX more to add to results record:
     # hashes of generated files
     # spawn code needs to add some results to results_record,
     # like generated stdio files.
-    # walk ptd to discover unexpectedly-generated files
-    return rc
 
-#####################################################################
-#####################################################################
+    # walk ptd to discover unexpectedly-generated files
+
+    return rc
 
 
 def get_tool_info(toolns):
@@ -2704,9 +3163,9 @@ def get_tool_info(toolns):
             error('Expected RC is not an Integer')
             return (None, None)
         if toolns == tool_ns:
-            debug('SUCCESS, valid tool ' + tool_name)
+            # debug('SUCCESS, valid tool ' + tool_name)
             return (tool_name, expected_rc)
-    error('Invalid toolns: ' + toolns)
+    error('Unrecognized tool namespace: ' + toolns)
     return (None, None)
 
 
@@ -2760,16 +3219,16 @@ def dir_exists(path, verbose=False):
 def path_exists(path):
     '''Check if a file exists, returns True if exists, False if not.'''
     if is_none_or_null(path):
-        error('path_exists: File name not specified')
+        error('Cannot check if path exists if the input is null')
         return False
     try:
         if os.path.isfile(path) and os.access(path, os.F_OK) and os.access(path, os.R_OK):
-            info('File exists and is readable: ' + path)
+            # info('File exists and is readable: ' + path)
             return True
         # debug('path_exists(): File missing or unreadable: ' + path)
         return False
     except:
-        error('Unexpected exception checking for path: ' + path)
+        error('Unexpected exception verifying path: ' + path)
         sys.exc_info()
         return False
 
@@ -2786,10 +3245,10 @@ def is_root():
     '''Returns True if user is running as root, False if not.'''
     uid = os.getuid()
     if uid == 0:
-        info('User is ROOT, UID: ' + str(uid))
+        debug('User is ROOT, UID: ' + str(uid))
         return True
     else:
-        info('User is NOT root, UID: ' + str(uid))
+        debug('User is NOT root, UID: ' + str(uid))
         return False
 
 
@@ -2854,8 +3313,7 @@ def os_is_freebsd():
 
 def os_is_macos():
     '''Returns True if OS is macOS, False if not.'''
-    debug('platform.system: ' + platform.system())
-    if 'darwin' in platform.system():
+    if 'Darwin' in platform.system():
         return True
     return False
 
@@ -2865,6 +3323,19 @@ def os_is_unix():
     if os_is_linux() or os_is_freebsd() or os_is_macos():
         return True
     return False
+
+
+def is_sudo_root():
+    '''Returns True if user is root via sudo, False if not.'''
+    if not is_unix_user_root():
+        error('User is not SuperUser')
+        return False
+    uid = os.getenv('SUDO_UID')
+    if uid == None:
+        error('No SUDO_UID set')
+        return False
+    # info('User is SUDO root')
+    return True
 
 
 def is_windows_user_administrator():
@@ -2927,7 +3398,7 @@ def is_user_root():
             warning('User is not Windows Administrator')  # XXX disable colorizing
     if os_is_unix():
         unix_root = is_unix_user_root()
-        show_sudo_vars()
+        # show_sudo_vars()
         if not unix_root:
             warning('User is not Unix root')  # XXX disable colorizing
     root = (win_admin or unix_root)
@@ -2936,7 +3407,7 @@ def is_user_root():
 
 def show_sudo_vars():
     '''Show SUDO-centric environment variables, on Unix.
-    
+
     NOTE: Only supports SuperUser via SUDO.
     WARNING: No support for SU, or logging in as root!'''
     # XXX study best practices to determining sudo.
@@ -2949,11 +3420,11 @@ def show_sudo_vars():
     user = os.getenv('SUDO_USER')
     uid = os.getenv('SUDO_UID')
     if not is_none_or_null(command):
-        info('SUDO_COMMAND = ' + command)
+        debug('SUDO_COMMAND = ' + command)
     if not is_none_or_null(user):
-        info('SUDO_USER = ' + user)
+        debug('SUDO_USER = ' + user)
     if not is_none_or_null(uid):
-        info('SUDO_UID = ' + uid)
+        debug('SUDO_UID = ' + uid)
 
 
 def show_user_group_process_info():
@@ -2993,11 +3464,9 @@ def show_user_group_process_info():
     try:
         user = os.environ['USER']
         home = os.environ['HOME']
-        username = os.environ['USERNAME']
         logname = os.environ['LOGNAME']
-        log('USER     = ' + user)
         log('HOME     = ' + home)
-        log('USERNAME = ' + username)
+        log('USER     = ' + user)
         log('LOGNAME  = ' + logname)
     except:
         error('Unable to get env info.')
@@ -3070,6 +3539,12 @@ def show_diagnostics():
     # BIOS or UEFI-based, or other...
     # manufacturer of CPU. Eg, AMD can't run CHIPSEC tests.
     log('Diagnostic information:')
+    debug('diagnosing root groups..')
+    diagnose_groups("root", "root")
+    #debug('diagnosing user groups..')
+    #diagnose_groups("user", "user")
+    print()
+    sudo_user_diags()
     print()
     show_user_group_process_info()
     print()
@@ -3143,35 +3618,13 @@ def show_diagnostics():
 def supported_os(verbose=False):
     '''Identify the host operating system.
 
+    Check if OS is supported. adjust OS logging if not available.
     Return True if recognized, False if not.'''
-    # Check for supported OS, and adjust OS logging if not available.
-    # sys.platform.beginswith('darwin')
-    os = platform.system()
-    # XXX Untested: FreeBSD, macOS, Windows, UEFI
-
     if verbose:
         info('platform.system: ' + platform.system())
         info('platform.release: ' + platform.release())
-        # platform.system(): Darwin, cygwin, Linux, freebsd, Windows
         info('sys.platform: ' + sys.platform)
-        # os.name: 'nt', 'posix'
         info('os.name: ' + os.name)
-
-#    if os.startswith('Linux'):
-#        info('Running Linux')
-#    elif os.startswith('Darwin'):
-#        info('Running macOS')
-#    elif os.startswith('FreeBSD'):
-#        info('Running FreeBSD')
-#    elif os.startswith('Windows'):
-#        info('Running Windows')
-#    elif os.startswith('CYGWIN'):
-#        info('Running CygWin')
-#    elif os.startswith('UEFI'):
-#        info('Running UEFI Shell?')
-#    else:
-#        info('Running UNKNOWN platform!')
-
     recognized_os = True
     if os_is_unix():
         if app_state['syslog_mode'] and not SYSLOG_AVAILABLE:
@@ -3192,8 +3645,16 @@ def supported_os(verbose=False):
             warning('UEFI does not support Window EventLog logging')
             info('Continuing with EventLog support disabled')
             app_state['eventlog_mode'] = False
-#    elif os_is_windows():
-#       Disable EventLog if module isn't available, similar to Unix/syslog
+    elif os_is_windows():
+        debug('Windows codepath is untested..')
+        if app_state['eventlog_mode'] and not EVENTLOG_AVAILABLE:
+            warning('Windows EventLog module not available')
+            info('Continuing with EventLog support disabled')
+            app_state['eventlog_mode'] = False
+        if app_state['syslog_mode']:
+            warning('Windows does not support UNIX SysLog logging')
+            info('Continuing with SysLog support disabled')
+            app_state['syslog_mode'] = False
     else:
         recognized_os = False
         error('Unsupported platform (patches appreciated)')
@@ -3211,6 +3672,7 @@ def supported_python(
     Python version it supports.
 
     FIXME: revise this, no longer dependent on CPython 2.7x!
+    XXX: Test if CHIPSEC will work uner PyPy.
 
     required_impl -- implementation name required (eg, 'CPython')
     required_major -- major version required (eg, 2)
@@ -3235,9 +3697,8 @@ def supported_python(
     '''
     if verbose:
         info(required_impl + ' for Python v' +
-                    str(required_major) + '.' +
-                    str(required_minor) + ' is required')
-    # 'CPython’, ‘IronPython’, ‘Jython’, ‘PyPy’.
+             str(required_major) + '.' +
+             str(required_minor) + ' is required')
     impl = platform.python_implementation()
     if verbose:
         info('Current Python implementation: ' + impl)
@@ -3250,7 +3711,7 @@ def supported_python(
     (major, minor, _, _, _) = sys.version_info
     if verbose:
         info('Current Python version: v' + str(major) + '.' + str(minor))
-    if ((major != required_major) and (minor != required_minor)):
+    if (major != required_major) and (minor != required_minor):
         error('Current Python is not the required Python version')
         return False
     return True
@@ -3299,30 +3760,6 @@ def generate_uuid(hex_style=True, urn_style=False, uuid1=False, uuid4=False,
     else:
         error('Must set either hex or urn to True')
         return None
-
-
-def get_user_home_directory():
-    '''Get user's home directory.
-
-    Used to get pointer to where the 'Parent Directory' (PD)
-    will be created under.
-
-    Return string of dir, or None if something bad happened.
-    '''
-    if not os_is_unix():
-        error('Non-UNIX OS calling UNIX-centric code')
-        return None
-    home = None
-    try:
-        home = os.environ['HOME']
-    except:
-        error('Unable to get HOME environment variable')
-        sys.exc_info()
-        return None
-    if is_none_or_null(home):
-        error('HOME environment variable has is empty')
-        return None
-    return home
 
 
 def is_dir_empty(root):
@@ -3476,119 +3913,119 @@ def chipsec(toolns, tool, prd, ptd, erc):
 def chipsec_test_memconfig(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m memconfig'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'memconfig']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'memconfig']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_remap(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m remap'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'remap']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'remap']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_smm_dma(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m smm_dma'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'smm_dma']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'smm_dma']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_secureboot_variables(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.secureboot.variables [-a modify]'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.secureboot.variables']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.secureboot.variables']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_uefi_access_uefispec(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.uefi.access_uefispec'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.uefi.access_uefispec']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.uefi.access_uefispec']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_uefi_s3bootscript(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.uefi.s3bootscript [-a <script_address>]'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.uefi.s3bootscript']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.uefi.s3bootscript']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_bios_kbrd_buffer(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.bios_kbrd_buffer'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.bios_kbrd_buffer']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.bios_kbrd_buffer']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_bios_smi(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.bios_smi'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.bios_smi']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.bios_smi']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_bios_ts(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.bios_ts'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.bios_ts']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.bios_ts']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_bios_wp(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.bios_wp'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.bios_wp']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.bios_wp']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_ia32cfg(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.ia32cfg'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.ia32cfg']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.ia32cfg']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_rtclock(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.rtclock'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.rtclock']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.rtclock']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_smm(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.smm'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.smm']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.smm']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_smrr(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.smrr'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.smrr']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.smrr']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_spi_desc(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.spi_desc'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.spi_desc']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.spi_desc']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_spi_fdopss(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.spi_fdopss'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.spi_fdopss']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.spi_fdopss']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_test_spi_lock(toolns, tool, prd, ptd, erc):
     '''Call chipsec_main -m common.spi_lock'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-m', 'common.spi_lock']
+    cmd = ['python', '-m', 'chipsec_main', '-m', 'common.spi_lock']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3615,7 +4052,7 @@ def chipsec_uefi_blacklist(toolns, tool, prd, ptd, erc, rom_bin):
     if fail_if_missing('chipsec_uefi_blacklist_offline', rom_bin):
         return 1
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_main', '-i', '-n', '-m', 'tools.uefi.blacklist', '-a', ',' + blacklist_file]
+    cmd = ['python', '-m', 'chipsec_main', '-i', '-n', '-m', 'tools.uefi.blacklist', '-a', ',' + blacklist_file]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3636,7 +4073,7 @@ def chipsec_acpi_table(toolns, tool, prd, ptd, erc):
     # XXX learn how to use <name> arg
     # XXX validate input
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'acpi', 'table', 'acpi_tables.bin']
+    cmd = ['python', '-m', 'chipsec_util', 'acpi', 'table', 'acpi_tables.bin']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3650,21 +4087,21 @@ def chipsec_platform(toolns, tool, prd, ptd, erc):
 def chipsec_cmos_dump(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util cmos dump'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'cmos', 'dump']
+    cmd = ['python', '-m', 'chipsec_util', 'cmos', 'dump']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_cpu_info(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util cpu info'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'cpu', 'info']
+    cmd = ['python', '-m', 'chipsec_util', 'cpu', 'info']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_cpu_pt(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util cpu pt'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'cpu', 'pt']
+    cmd = ['python', '-m', 'chipsec_util', 'cpu', 'pt']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3674,7 +4111,7 @@ def chipsec_decode_types(toolns, tool, prd, ptd, erc):
     # XXX howto determine list, source-time or run-time?
     # XXX for Linux can use SysFS's copy of ACPI tables to get list.
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'decode', 'types']
+    cmd = ['python', '-m', 'chipsec_util', 'decode', 'types']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3698,21 +4135,21 @@ def chipsec_decode(toolns, tool, prd, ptd, erc, fw_type, spi_bin):
         error('Decode failed, file "' + spi_bin + '" missing')
         return 1
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'decode', spi_bin]
+    cmd = ['python', '-m', 'chipsec_util', 'decode', spi_bin]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_ec_dump(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util ec dump'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'ec', 'dump']
+    cmd = ['python', '-m', 'chipsec_util', 'ec', 'dump']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_io_list(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util io list'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'io', 'list']
+    cmd = ['python', '-m', 'chipsec_util', 'io', 'list']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3720,7 +4157,7 @@ def chipsec_iommu_list(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util iommu list''' 
     # XXX Save results and feed it into 'iommu status'
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'iommu', 'list']
+    cmd = ['python', '-m', 'chipsec_util', 'iommu', 'list']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3729,7 +4166,7 @@ def chipsec_iommu_status(toolns, tool, prd, ptd, erc, iommu_engine):
     # XXX get input iommu_engine from user, or from output of 'iommu list'
     # XXX validate input
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'iommu', 'status', iommu_engine]
+    cmd = ['python', '-m', 'chipsec_util', 'iommu', 'status', iommu_engine]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3738,14 +4175,14 @@ def chipsec_iommu_config(toolns, tool, prd, ptd, erc, iommu_engine):
     # XXX get input iommu_engine from output of 'iommu list'
     # XXX validate input
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'iommu', 'config', iommu_engine]
+    cmd = ['python', '-m', 'chipsec_util', 'iommu', 'config', iommu_engine]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_iommu_pt(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util iommu pt'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'iommu', 'pt']
+    cmd = ['python', '-m', 'chipsec_util', 'iommu', 'pt']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3755,14 +4192,14 @@ def chipsec_mmio_list(toolns, tool, prd, ptd, erc):
     # XXX need list of MMIO_BAR_names. Static in spec/code or dynamic?
     # XXX use 'mmio dump <MMIO_BAR_name>'
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'mmio', 'list']
+    cmd = ['python', '-m', 'chipsec_util', 'mmio', 'list']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_pci_enumerate(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util pci enumerate'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'pci', 'enumerate']
+    cmd = ['python', '-m', 'chipsec_util', 'pci', 'enumerate']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3770,7 +4207,7 @@ def chipsec_pci_dump(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util pci dump [<bus> <device> <function>]'''
     # XXX Need another variation of tool that dumps specific bus/device
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'pci', 'dump']
+    cmd = ['python', '-m', 'chipsec_util', 'pci', 'dump']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3779,14 +4216,14 @@ def chipsec_pci_xrom(toolns, tool, prd, ptd, erc):
     # XXX Need another variation of tool that dumps specific bus/device info
     # XXX need to download oprom.bin files for each PCIe device
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'pci', 'xrom']
+    cmd = ['python', '-m', 'chipsec_util', 'pci', 'xrom']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_spd_detect(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util spd detect'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'spd', 'detect']
+    cmd = ['python', '-m', 'chipsec_util', 'spd', 'detect']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3795,7 +4232,7 @@ def chipsec_spd_dump(toolns, tool, prd, ptd, erc):
     # XXX Need another variation of tool that dumps specific device_addr info?
     # XXX Need a list of interesting spd device addresses. Static or dynamic?
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'spd', 'dump']
+    cmd = ['python', '-m', 'chipsec_util', 'spd', 'dump']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3814,14 +4251,14 @@ def chipsec_spi_dump(toolns, tool, prd, ptd, erc):
     # XXX hash rom.bin and publish a few ways
     ign = warn_if_overwriting_file('chipsec_util spi dump', filename)
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'spi', 'dump', filename]
+    cmd = ['python', '-m', 'chipsec_util', 'spi', 'dump', filename]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_spi_info(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util spi info'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'spi', 'info']
+    cmd = ['python', '-m', 'chipsec_util', 'spi', 'info']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3841,7 +4278,7 @@ def chipsec_spidesc(toolns, tool, prd, ptd, erc):
     # XXX also run 'spidesc' alternative of this command.
     ign = warn_if_overwriting_file('chipsec_util spidesc', filename)
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'spidesc', filename]
+    cmd = ['python', '-m', 'chipsec_util', 'spidesc', filename]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3849,21 +4286,21 @@ def chipsec_ucode_id(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util ucode id'''
     # Need another variation of this tool which calls DECODE
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'ucode', 'id']
+    cmd = ['python', '-m', 'chipsec_util', 'ucode', 'id']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_uefi_types(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util uefi types'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'uefi', 'types']
+    cmd = ['python', '-m', 'chipsec_util', 'uefi', 'types']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_uefi_var_list(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util uefi var-list'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'uefi', 'var-list']
+    cmd = ['python', '-m', 'chipsec_util', 'uefi', 'var-list']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3876,14 +4313,14 @@ def chipsec_uefi_decode(toolns, tool, prd, ptd, erc, rom_bin):
         error('File ' + filename + ' missing, skipping')
         return 1  # XXX  mark as SKIPPED
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'uefi', 'decode', filename]
+    cmd = ['python', '-m', 'chipsec_util', 'uefi', 'decode', filename]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 def chipsec_uefi_tables(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util uefi tables'''
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'uefi', 'tables']
+    cmd = ['python', '-m', 'chipsec_util', 'uefi', 'tables']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3896,7 +4333,7 @@ def chipsec_uefi_keys(toolns, tool, prd, ptd, erc, uefi_keyvar_file):
     # XXX validate input/output file
     ign = warn_if_overwriting_file('chipsec_util uefi keys', filename)
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'uefi', 'keys', filename]
+    cmd = ['python', '-m', 'chipsec_util', 'uefi', 'keys', filename]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3904,7 +4341,7 @@ def chipsec_s3bootscript(toolns, tool, prd, ptd, erc):
     '''Call chipsec_util uefi s3bootscript [script_address]'''
     # XXX add script_address arg (how do you find this address?)
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'uefi', 's3bootscript']
+    cmd = ['python', '-m', 'chipsec_util', 'uefi', 's3bootscript']
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3916,7 +4353,7 @@ def chipsec_uefi_nvram(toolns, tool, prd, ptd, erc):
     #     warning('No FW_TYPE specified')
     ign = warn_if_overwriting_file('chipsec_util uefi nvram', filename)
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'uefi', 'nvram', filename]
+    cmd = ['python', '-m', 'chipsec_util', 'uefi', 'nvram', filename]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
@@ -3928,13 +4365,16 @@ def chipsec_uefi_nvram_auth(toolns, tool, prd, ptd, erc):
     #     warning('No FW_TYPE specified')
     ign = warn_if_overwriting_file('chipsec_util uefi nvram-auth', filename)
     info('Executing ' + toolns + ' variation of tool: ' + tool)
-    cmd = ['chipsec_util', 'uefi', 'nvram-auth', filename]
+    cmd = ['python', '-m', 'chipsec_util', 'uefi', 'nvram-auth', filename]
     return spawn_process(cmd, ptd, erc, toolns)
 
 
 #####################################################################
 
 # acpica-tools.py
+
+
+# XXX acpixtract()
 
 
 def acpidump(toolns, tool, prd, ptd, erc):
@@ -4008,12 +4448,13 @@ def flashrom(toolns, tool, prd, ptd, erc):
     #     rc = flashrom_get_version(toolns, tool, prd, ptd, erc)
     # elif toolns == 'flashrom_get_help':
     #     rc = flashrom_get_help(toolns, tool, prd, ptd, erc)
+    rc = -1
     if toolns == 'flashrom':
 #        rc = flashrom_dump_rom(toolns, tool, prd, ptd, erc,
 #                      get_tool_arg(toolns, 'rom_bin_file'))
 #    else:
         error(tool + ' resolver: no entry found for: ' + toolns)
-        return -1
+        return rc
     return rc
 
 
@@ -4289,29 +4730,187 @@ def pawn(toolns, tool, prd, ptd, erc):
     return spawn_process(cmd, ptd, erc, toolns)
 
 #####################################################################
+#####################################################################
 
 
-def show_exception_info(e):
-    log('error: ' + str(e.errno) + ', ' + e.strerr)
-    log(str(Foo.__mro__))
-    log('reason: ' + e)
-    if e.__cause__:
-        log('cause: ' + e.__cause__)
-    if e.__context__:
-        log('context: ' + e.__context__)
-    log('args:')
-    output_wrapped(e.args)
-    # . . .
-    if e.errno == errno.ENOENT:
-        log('ENOENT: file not found')
-    # . . .
-    if e.errno != errno.ENOENT:
-        raise
-    log('ENOENT: file not found: ' + e.filename)
-    # . . .
-    if e.errno == errno.EACCES:
-        log('EACCESS: permission denied')
-    # . . .
+def diagnose_groups(uid_name_string, gid_name_string):
+    '''TBW'''
+    # XXX test when user and/or root is a member of multiple groups
+    # test if macOS/FreeBSD behavior is the same as Linux. See the Python
+    # documentation Note for os.getgroups() and os.setgrups().
+    for (name, passwd, gid, members) in grp.getgrall():
+        debug('name=' + name + ',  gid=' + str(gid) + ', members=' + str(members))
+        # if username in members: gids.append(gid)
+    all_groups = grp.getgrall()
+    # output_wrapped(all_groups)
+    # debug(str(all_groups))
+    #for g in all_groups:
+        #output_wrapped(str(g))
+        # debug(str(g))
+    groups = os.getgroups()
+    #for g in groups:
+        #output_wrapped(str(g))
+        # debug(str(g))
+    gname = gid_name_string
+    uname = uid_name_string
+    print('uname: ' + uname)
+    print('gname: ' + gname)
+    gid = int(grp.getgrnam(gname)[2])
+    uid = int(grp.getgrnam(gname)[2])
+    print('uid: ' + str(uid))
+    print('gid: ' + str(gid))
+    uid = int(pwd.getpwnam(uname).pw_uid)
+    gid = int(grp.getgrnam(gname).gr_gid)
+    print('uid: ' + str(uid))
+    print('gid: ' + str(gid))
+    cur_uid = os.getuid()
+    cur_uid_name = pwd.getpwuid(os.getuid())[0]
+    cur_gid = os.getgid()
+    cur_group = grp.getgrgid(os.getgid())[0]
+    print('uid: ' + str(cur_uid))
+    print('uid name: ' + str(cur_uid_name))
+    print('gid: ' + str(cur_gid))
+    print('group: ' + str(cur_group))
+
+#######################################
+
+def do_hash(fn, hash_fn):
+    '''TBW'''
+    if is_none_or_null(fn):
+        error('Cannot create hash file, filename to hash is null')
+        return False
+    if is_none_or_null(hash_fn):
+        error('Cannot create hash file, hash filename is null')
+        return False
+    debug('do_hash_file: fn = ' + fn)
+    debug('do_hash_file: hash_fn = ' + hash_fn)
+    try:
+        f = open(hash_fn, 'rb')  # encoding='utf-8' , errors='strict')
+        # XXX test size before reading into memory
+        file_buf = f.read()  # .decode('utf-8')
+        f.close()
+        if not is_none_or_null(file_buf):
+            # hash_fn = fn + '.sha256'
+            info('Creating side-car hash file: ' + hash_fn)
+            create_sidecar_hash_file(fn, file_buf, hash_fn)
+        file_buf = None
+    except IOError as e:
+        log('Exception ' + str(e.errno) + ': ' + str(e))
+        error('Error while creating hash file')
+        sys.exc_info()
+        return False
+    return True
+
+
+def create_sidecar_hash_files(path):
+    '''For each file in a directory, create a new side-car hash file.
+
+    Intended to be used in each Per-Tool-Directory (PTD), where tools
+    are run, some and generate multiple files (eg, rom.bin, ACPI tables, ...)
+    This code creates a 'side-car' hash file for each generated file
+    (eg, rom.bin.sha256 for rom.bin, output.txt.sha256 for output.txt, ...).
+
+    Run this before generating that directory's manifest.txt file.
+    After running this, don't create any new files or modify any
+    existing files in this directory. ...except for modifying file
+    owner/group/attributes in the Unix sudo case.
+
+    Returns True if successful, False if an error occurred.'''
+    # XXX Support (or fail with errors): dirs, files with links.
+    # XXX can a hash have a space in it, which would require escaping?
+    # XXX Support file with spaces or otherwise needing escaping
+    # XXX How does sha256sum handle escaping files (eg, with spaces)?
+    # XXX What other file formats are needed (eg, XML for one MSFT tool)?
+    HASH_FILENAME_EXTENSION = '.sha256'
+    if is_none_or_null(path):
+        error('Cannot create hash files, directory is null')
+        return False
+    if not dir_exists(path):
+        error('Cannot create hash files, directory does not exist: ' + path)
+        return False
+    hash_fn = None
+    try:
+        for root, dirs, files in os.walk(path):
+            debug('create_hash_file: root dir = ' + root)
+            for fn in files:
+                joined = os.path.join(path, fn)
+                hash_fn = joined + HASH_FILENAME_EXTENSION
+                debug('create_hash_file: fn = ' + fn)
+                debug('create_hash_file: joined = ' + joined)
+                debug('create_hash_file: hash_fn = ' + hash_fn) 
+                status = do_hash(joined, hash_fn)  # use joined for fn!
+    except OSError as e:
+        error('Failed to create hash file')
+        log('Exception ' + str(e.errno) + ': ' + str(e))
+        sys.exc_info()
+        return False
+    # XXX propogate status code upstream
+    return True
+
+
+def create_manifest_file(path):
+    '''Create a manifest.txt for all files in a directory.
+
+    Create a manifest.txt file, in the specified directory, and
+    for each file in that directory, add one line to the manifest,
+    with a line format of: "<hash> + <space> + <filename> + <newline>".
+
+    Returns True if successful, False if an error occurred.'''
+    # XXX MULTIPLE ISSUES in create_sidecar_hash_files() are identical to here!
+    MANIFEST_FILENAME = 'manifest.txt'
+    if path is None:
+        error('Directory to create manifest for is null')
+        return False
+    if not dir_exists(path):
+        error('Directory to create manifest for does not exist: ' + path)
+        return False
+    debug('make_manifest: path = ' + path)
+    fn = path + os.sep + MANIFEST_FILENAME  # os.path.join()
+    debug('Creating manifest file: ' + fn)
+    if path_exists(fn):
+        error('Not overwriting existing manifest file: ' + fn)
+        return False
+    try:
+        # Open the manifest file
+        debug('Opening manifest file: ' + fn)
+        m = open(fn, 'wt')  # , encoding='utf-8')  # , errors='strict')
+        for root, dirs, files in os.walk(path):
+            debug('make_manifest: root dir = ' + root)
+            # For each file, write one line to manifest file
+            for f in files:
+                debug('make_manifest: current file = ' + f)
+                joined = os.path.join(path, f)
+                debug('make_manifest: current joined file = ' + joined)
+                # The next few lines can probably be replaced with a hash function
+                f_fn = open(f, 'rb')  # , encoding='utf-8', errors='strict')
+                file_buf = f_fn.read()
+                f_fn.close()
+                debug('make_manifest: x')
+                hash_buf = hash_sha256_buffer(file_buf)
+                # Check if hash_buf is null.
+
+                manifest_line = hash_buf + ' ' + f + os.linesep
+                if is_none_or_null(manifest_line):
+                    error('Manifest record line is null!')
+                debug('make_manifest: manifest line: ' + manifest_line)
+                m.write(manifest_line)
+                m.flush()
+        debug('Closing manifest file')
+        m.close()
+    except IOError as e:
+        error('IOError: Failed to create manifest file: ' + fn)
+        log('Exception ' + str(e.errno) + ': ' + str(e))
+        sys.exc_info()
+        return False
+    except OSError as e:
+        error('OSError: Failed to create manifest file: ' + fn)
+        log('Exception ' + str(e.errno) + ': ' + str(e))
+        sys.exc_info()
+        return False
+    # XXX propogate status code upstream
+    return True
+
+#######################################
 
 
 # The initial main entry point, which calls main().
