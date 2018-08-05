@@ -2,6 +2,10 @@ Changelog
 =========
 
 2018/08/04
+ + Version 0.0.3-PRE-ALPHA
+ + added INTEL-SA-00075-Discovery-Tool for CVE-2017-5689 AMT vulnerability
+
+2018/08/04
  + Version 0.0.2-PRE-ALPHA
  + added syslog
 

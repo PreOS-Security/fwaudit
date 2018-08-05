@@ -92,7 +92,7 @@ APP_METADATA = {
     'date': '2018-08-03 19:46',
     'copyright': '2017-2018',
     'short_name': 'fwaudit',
-    'full_name': 'FirmWare Audit (FWAudit)',
+    'full_name': 'Firmware Audit (fwaudit)',
     'description': 'Platform firmware diagnostic tool.',
     'short_author': 'PreOS',
     'version': __version__ + '-' + __status__,
@@ -876,6 +876,15 @@ TOOLS = [
         'desc': 'FWTS --uefi_tests',
         'mode': 'live',
         'exrc': 0,
+        'expected': [],
+        'actual': [],
+        'args': {}
+    }, {
+        'name': 'intel_amt_discovery',
+        'tool': 'INTEL-SA-00075-Discovery-Tool',
+        'desc': 'INTEL-SA-00075-Discovery-Tool',
+        'mode': 'live',
+        'exrc': 254,
         'expected': [],
         'actual': [],
         'args': {}
@@ -3020,7 +3029,7 @@ def run_meta_profile(pd, prd):
 
 def get_pass_fail_status(toolns, tool, rc, erc):
     debug('Expected_rc=' + str(erc) + ', rc=' + str(rc))
-    erc = rc  # XXX mock sucess, fix properly!
+    erc = rc  # XXX mock success, fix properly!
     if rc == erc:
         status = 'PASS'
     else:
@@ -3046,7 +3055,7 @@ def tool_resolver(toolns, pr, prd, ptd):
     Return status code of tool to upstream caller.
     '''
     # XXX This is horrible code, refactor away completely.
-    # XXX Post 0.0.1, replace this ugly code with:
+    # XXX Post 0.0.2, replace this ugly code with:
     # better TOOLS dict,
     # template native exec function,
     # template python module exec function,
@@ -3110,6 +3119,8 @@ def tool_resolver(toolns, pr, prd, ptd):
         rc = flashrom(toolns, tool, prd, ptd, erc)
     elif tool == 'fwts':
         rc = fwts(toolns, tool, prd, ptd, erc)
+    elif tool == 'INTEL-SA-00075-Discovery-Tool':
+        rc = intel_amt_discovery(toolns, tool, prd, ptd, erc)
     elif tool == 'lsusb':
         rc = lsusb(toolns, tool, prd, ptd, erc)
     elif tool == 'lspci':
@@ -4696,6 +4707,21 @@ def lspci_xxx(toolns, tool, prd, ptd, erc):
     cmd = [tool, '-xxx']
     return spawn_process(cmd, ptd, erc, toolns)
 
+
+#####################################################################
+
+# intel_amt_discovery.py
+
+# Detect Intel SA-00075 aka: CVE-2017-5689 AMT vulnerability
+
+def intel_amt_discovery(toolns, tool, prd, ptd, erc):
+    '''Run live command: 'INTEL-SA-00075-Discovery-Tool'.'''
+    if not os_is_linux():
+        error(tool + ' only works on Linux')
+        return -1  # XXX generate exception
+    info('Executing ' + toolns + ' variation of tool: ' + tool)
+    cmd = [tool]
+    return spawn_process(cmd, ptd, erc, toolns)
 
 #####################################################################
 

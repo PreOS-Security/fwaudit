@@ -81,6 +81,8 @@ The current release has the following system restrictions:
 
   * dmidecode
 
+  * INTEL-SA-00075-Discovery-Tool
+
 ## Installing
 
 CPython 2.7x and the other assorted OS utilities are typically preinstalled. Just in case:
@@ -101,13 +103,19 @@ Install FWTS:
 
 $ sudo apt-get install fwts
 
+Install INTEL-SA-00075-Discovery-Tool:
+
+https://downloadcenter.intel.com/download/26755/INTEL-SA-00075-Detection-and-Mitigation-Tool
+
+sudo cp INTEL-SA-00075-Discovery-Tool /usr/local/sbin/
+
 Download fwaudit:
 
 git clone https://github.com/PreOS-Security/fwaudit.git
 
 OR:
 
-wget https://github.com/PreOS-Security/fwaudit/archive/v0.0.2.zip
+wget https://github.com/PreOS-Security/fwaudit/archive/v0.0.3.zip
 
 fwaudit does not currently have any packaging, or standard installation directory, so you simply run it directly from the download dir, or copy it to the location of your choice.
 
