@@ -115,7 +115,7 @@ git clone https://github.com/PreOS-Security/fwaudit.git
 
 OR:
 
-wget https://github.com/PreOS-Security/fwaudit/archive/v0.0.3.zip
+wget https://github.com/PreOS-Security/fwaudit/archive/v0.0.4.zip
 
 fwaudit does not currently have any packaging, or standard installation directory, so you simply run it directly from the download dir, or copy it to the location of your choice.
 
