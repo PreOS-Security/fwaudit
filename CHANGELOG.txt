@@ -1,6 +1,9 @@
 Changelog
 =========
 
+ + Version 0.0.4-PRE-ALPHA
+ + added INTEL SA-00085 Discovery Tool for CVE-2017-5705,CVE-2017-5708,CVE-2017-5711,CVE-2017-5712,CVE-2017-5706,CVE-2017-5707,CVE-2017-5709,CVE-2017-5710,CVE-2017-5706,CVE-2017-5709 ME / TEE / SPS Vulnerability
+
 2018/08/04
  + Version 0.0.3-PRE-ALPHA
  + added INTEL-SA-00075-Discovery-Tool for CVE-2017-5689 AMT vulnerability

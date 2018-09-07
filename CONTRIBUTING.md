@@ -5,7 +5,7 @@ If you'd like to contribute to the project, here are some needed features.
 Most of the current code needs to be updated to fix defects, or refactored
 to be more Pythonic.
 
-The current fwaudit release is 0.0.2-PRE-ALPHA.
+The current fwaudit release is 0.0.4-PRE-ALPHA.
 
 Items planned on being addressed in the next release are marked with 'M2'.
 

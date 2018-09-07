@@ -3,7 +3,7 @@
 # vim: set expandtab sw=4 :
 
 '''
-Firmware Audit (fwaudit)
+Firmware Audit, v0.0.4-PRE-ALPHA
 Copyright (C) 2017-2018 PreOS Security Inc.
 All Rights Reserved.
 
@@ -74,8 +74,8 @@ except ImportError:
 # Global variable: APP_METADATA
 
 # XXX which of these are Python/PEP/PyPI standards?
-__version__ = '0.0.3'
-__status__ = 'ALPHA'
+__version__ = '0.0.4'
+__status__ = 'PRE-ALPH
 __author__ = 'PreOS Security Inc'
 __copyright__ = 'Copyright 2017-2018, PreOS Security'
 __credits__ = ['Lee Fisher', 'Paul English']
@@ -883,6 +883,16 @@ TOOLS = [
         'actual': [],
         'args': {}
     }, {
+        'name': 'intel_me_detection',
+        'tool': 'intel_sa00086.py',
+        'desc': 'INTEL-SA-00086-Detection-Tool',
+        'mode': 'live',
+        'exrc': 254,
+        'expected': [],
+        'actual': [],
+        'args': {}
+    }, {
+
         'name': 'lsusb',
         'tool': 'lsusb',
         'desc': 'lsusb -v -t',
@@ -3122,6 +3132,8 @@ def tool_resolver(toolns, pr, prd, ptd):
         rc = fwts(toolns, tool, prd, ptd, erc)
     elif tool == 'INTEL-SA-00075-Discovery-Tool':
         rc = intel_amt_discovery(toolns, tool, prd, ptd, erc)
+    elif tool == 'intel_sa00086.py':
+        rc = intel_me_detection(toolns, tool, prd, ptd, erc)
     elif tool == 'lsusb':
         rc = lsusb(toolns, tool, prd, ptd, erc)
     elif tool == 'lspci':
@@ -4767,6 +4779,24 @@ def intel_amt_discovery(toolns, tool, prd, ptd, erc):
     return spawn_process(cmd, ptd, erc, toolns)
 
 #####################################################################
+
+# intel_me_detection.py
+
+# Detect Intel SA-00086 aka: 
+# CVE-2017-5705,CVE-2017-5708,CVE-2017-5711,CVE-2017-5712,CVE-2017-5706,CVE-2017-5707,CVE-2017-5709,CVE-2017-5710,CVE-2017-5706,CVE-2017-5709 
+# Intel ME vulnerability
+
+def intel_me_detection(toolns, tool, prd, ptd, erc):
+    '''Run live command: ''intel_sa00086.py'.'''
+    if not os_is_linux():
+        error(tool + ' only works on Linux')
+        return -1  # XXX generate exception
+    info('Executing ' + toolns + ' variation of tool: ' + tool)
+    cmd = [tool]
+    return spawn_process(cmd, ptd, erc, toolns)
+
+#####################################################################
+
 
 # lsusb.py
 
