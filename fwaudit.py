@@ -3,7 +3,7 @@
 # vim: set expandtab sw=4 :
 
 '''
-Firmware Audit, v0.0.4-PRE-ALPHA
+Firmware Audit
 Copyright (C) 2017-2018 PreOS Security Inc.
 All Rights Reserved.
 
@@ -75,7 +75,7 @@ except ImportError:
 
 # XXX which of these are Python/PEP/PyPI standards?
 __version__ = '0.0.4'
-__status__ = 'PRE-ALPH
+__status__ = 'PRE-ALPHA'
 __author__ = 'PreOS Security Inc'
 __copyright__ = 'Copyright 2017-2018, PreOS Security'
 __credits__ = ['Lee Fisher', 'Paul English']
@@ -85,7 +85,7 @@ __license__ = 'GPL-2.0'
 # __license__ = 'https://opensource.org/licenses/GPL-2.0'
 
 APP_METADATA = {
-    'home_page': '<https://preossec.com/>',  # XXX create/test
+    'home_page': '<https://preossec.com/products/fwaudit>',  # XXX create/test
     'copyright': '2017-2018',
     'short_name': 'fwaudit',
     'full_name': 'Firmware Audit (fwaudit)',
