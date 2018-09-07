@@ -3,7 +3,7 @@
 # vim: set expandtab sw=4 :
 
 '''
-Firmware Audit, v0.0.2-PRE-ALPHA
+Firmware Audit (fwaudit)
 Copyright (C) 2017-2018 PreOS Security Inc.
 All Rights Reserved.
 
@@ -14,31 +14,28 @@ Firmware Audit is a firmware analysis tool which calls multiple tools
 
 For more information, see README.txt.
 
-WARNING: This is the 2 public release of this tool, aka Milestone2.
-It really is *PRE-ALPHA* quality! There are many defects, and few features.
-You should hold off until Milestone 3, when it should be more stable
-and useful. Thanks for your patience.
+This release is not yet feature complete, but is usable.
 '''
 
-# XXX new bugs/issues from 0.2:
-# BUG: stdio file has "<toolname>." prefix, remove. Eg, lspci.stdout.txt should be stdout.txt.
-# BUG: Python's os.getgroups() and os.setgroups() behave differently on Linux than on MacOSX. Need to ensure that the sudo code works on Mac.
-# BUG: Syslog (and eventually EventLog) output is a mirror of stdout, too much spew for syslog.  Update syslog output to be: list of tools run with status, list of generated files with hashes, aka the index/report.
-# BUG: everyplace a file is opened, should first check for a max size, in case file is huge. Unclear how big some rom.bins get. Need a user-specifed max, and understand the various system max values.
-# BUG: After initial creation of dir, don't keep updating owner/group/file-mode each run, only do that once.
-# BUG: global: standardize use of exceptions, int and bool return codes, some rcs overwritten raise LookupError("Invalid user: {!r}".format(foo))
-# BUG: CHIPSEC blacklist args not working, get_tool_arg()/set_tool_arg() list/dict issue.
-# TEST:  test sidecar hash file format against sha256sum tool.
-# TEST: sudo use with a user account and/or a root account that has multiple group memberships.
-# TEST: sidecar hash files against sha26sum
-# TEST: manifest files against sha256sum (or ??)
-# DOC: If SUDO used so that no SUDO_* environment variables are used, this code will not work.
-# DOC: The --output_dir command currently only works for the root user, not the sudo case.
+# Check file size against max buffer before opening/reading. Disallow large files until buffering logic added.
+# After initial creation of dir, don't keep updating owner/group/file-mode each run, only do that once.
+# Fix list/dict issues with get_tool_arg()/set_tool_arg(). Simplify by removing 'args' dict, and putting args one level higher.
+# Test sidecar hash file format against sha256sum tool.
+# Understand how to properly set single GID from list, especially macOS non-POSIX behavior. Test sudo use with a user account and/or a root account that has multiple group memberships, including >16.
+# Test sidecar hash files and manifest using sha26sum
+# Fix manifest, dealing with path names, not just same-directory filenames, in a manifest file, such that sha256sum tool can verify it, so they can be used at PRD level, not just PTD level.
+# Standardize use of return codes, int -vs- bool, some overwrite,
+#     raise LookupError('msg')
+#     status = os.EX_(OK, USAGE, DATAERROR, NOINPUT, NOTFOUND, NOPERM)
+# Standardize use of output formatting, esp in large output templates
+#    form = '{0:0.3d} xxx {1:0.2f}'; print(form.format(d,f))
+#    form = '''...{foo} ... {bar} ...'''; #print(form.format(foo='x', bar='y'))
 
 
 from __future__ import print_function
 from __future__ import division
 from __future__ import unicode_literals
+# XXX add floating point
 
 import sys
 import os
@@ -77,8 +74,8 @@ except ImportError:
 # Global variable: APP_METADATA
 
 # XXX which of these are Python/PEP/PyPI standards?
-__version__ = '0.0.2'
-__status__ = 'PRE-ALPHA'
+__version__ = '0.0.3'
+__status__ = 'ALPHA'
 __author__ = 'PreOS Security Inc'
 __copyright__ = 'Copyright 2017-2018, PreOS Security'
 __credits__ = ['Lee Fisher', 'Paul English']
@@ -89,7 +86,6 @@ __license__ = 'GPL-2.0'
 
 APP_METADATA = {
     'home_page': '<https://preossec.com/>',  # XXX create/test
-    'date': '2018-08-03 19:46',
     'copyright': '2017-2018',
     'short_name': 'fwaudit',
     'full_name': 'Firmware Audit (fwaudit)',
@@ -171,7 +167,6 @@ COLOR_DEFAULTS = {
 # Global variable: app_state
 # input from user: arguments that control program logic.
 app_state = {
-    # related: how much output to spew
     'debug': False,  # --debug
     'verbose': False,  # --verbose
     'logfile': None,  # --logfile
@@ -186,6 +181,8 @@ app_state = {
     'new_profiles': None,  # --new_profile=<json_string>
     'no_profile': None,  # --no_profile
     'selected_profile': None,
+    'max_profiles': '1000',
+    'meta_profile': [],
     'zip_results': False,  # --zip_results
     'output_dir': None,  # --output_dir dir string  (aka 'PD')
     'output_dir_specified': False,  # user specifed explicit PD using --output_dir
@@ -193,17 +190,14 @@ app_state = {
     'colorize': False,  # --colorize
     'omit_pii': False,  # --omit_pii
     'output_mode': 'merged',  # --output_mode
-    'hash_mode': False,  # --hash, --nohash
-    'manifest_mode': False,  # --manifest, --nomanifest
+    'hash_mode': True,  # --hash, --nohash
+    'manifest_mode': True,  # --manifest, --nomanifest
     'tools_and_profiles': None,  # sum of all tools + profiles + new_profiles
     'timestamp': None,  # timestamp of run, used to create target dir
     'switchar': '-',  # OS switch character
-    'max_buf': 50000,  # XXX add way to override? Proper value? subprocess
-    'max_profiles': '1000',
-    'meta_profile': [],
+    'max_buf': 50000,  # XXX add way to override. Proper value?
     'shell_script_redir_string': None,
     'sudo_based_usage': False,
-    'output_dir_specified': False,
 }
 
 ############################################################
@@ -1113,12 +1107,19 @@ def main():
 
         # start_results()  # XXX
 
+        start_cpu = time.clock()
+        start_real = time.time()
         # Run the tools!
         run_meta_profile(pd, prd)
+        end_cpu = time.clock()
+        end_real = time.time()
+        # XXX save this in per-run stats. Also create per-tool time stats elsewhere.
+        cpu_seconds = end_cpu - start_cpu
+        real_seconds = end_real - start_real
+        debug('Total CPU seconds: ' + str(cpu_seconds))
+        debug('Total Seconds: ' + str(real_seconds))
 
         # Post-processing, after running the tools
-        # Create manifest of PD? No files, only dirs.
-        # Create manifest of PRD? No files, only dirs.
         if is_sudo_root():
             # XXX need to fix PD dir perms, on first creation?
             debug('Changing SUDO root ownership/permissions to generated files..')
@@ -1152,7 +1153,7 @@ def parse_args():
     global app_state
     global TOOLS
     prolog = 'FirmWare Audit (FWAudit) is a platform firmware diagnostic tool.'
-    epilog = 'For more information, please read the User Guide.'
+    epilog = 'For more information, please read the User Guide (README).'
     c = app_state['switchar']  # '/' or '-', depending on OS
     p = argparse.ArgumentParser(description=prolog, epilog=epilog,
                                 prefix_chars=c, add_help=True)
@@ -1200,11 +1201,11 @@ def parse_args():
 #                   help='Create ZIP file of resulting directory of output.')
     p.add_argument('--output_dir',
                    action='store', default=None,
-                   help='Specify target directory to store generated files.')
+                   help='Specify target directory to store generated files. Not compatible with sudo case, use as root or with su.')
     p.add_argument('--output_mode',
                    choices=('merged', 'out_first', 'err_first'),
                    action='store', default=app_state['output_mode'],
-                   help='Specify how to log tool output. IN 0.1 RELEASE USE FOR ROOT ONLY, DO NOT USE WITH SUDO USER.')
+                   help='Specify how to log tool output. Currently for root use only, do not use with sudo use.')
  #   p.add_argument('--omit_pii',
  #                  action='store_true', default=False,
  #                  help='Omit known PII-centric data from results.')
@@ -1213,13 +1214,13 @@ def parse_args():
                    help='Use colored output for interactive console.')
     p.add_argument('--manifest',
                    action='store_true', default=False,
-                   help='Generate manifest file of hashes for generated files. DO NOT USE IN 0.1 RELEASE.')
+                   help='Generate manifest file of hashes for generated files.')
     p.add_argument('--nomanifest',
                    action='store_true', default=False,
                    help='Do not generate manifest files.')
     p.add_argument('--hash',
                    action='store_true', default=False,
-                   help='Generate SHA256 sidecar hash files for generated files. DO NOT USE IN 0.1 RELEASE.')
+                   help='Generate SHA256 sidecar hash files for generated files.')
     p.add_argument('--nohash',
                    action='store_true', default=False,
                    help='Do not generate sidecar hash files.')
@@ -1314,7 +1315,7 @@ def parse_args():
 def show_tool_version():
     '''Show program version info, for use with --version option.'''
     log(APP_METADATA['short_name'] + ' v' +
-        APP_METADATA['version'] + ', ' + APP_METADATA['date'])
+        APP_METADATA['version'])
 
 
 def startup_message():
@@ -1325,8 +1326,7 @@ def startup_message():
     Send initial message to logfile, if --logfile specified.
     '''
     print()
-    log(APP_METADATA['full_name'] + ' Version ' +
-        APP_METADATA['version'] + ' (' + APP_METADATA['date'] + ')')
+    log(APP_METADATA['full_name'] + ' Version ' + APP_METADATA['version'])
     log('Copyright (C) ' + APP_METADATA['copyright'] + ' ' +
         APP_METADATA['full_author'] + '. All rights reserved.')
     if app_state['syslog_mode']:
@@ -1368,11 +1368,13 @@ def shutdown_message(status):
 # and omit final punctuctuation (except for log() function).
 # Using log log() is nearly the same as print().
 # The log() code adds no prefix or suffix, presuming you will do it.
+# The critical code wraps message between "ERROR: " and "!", and displays more info on the exception e.
 # The error code wraps message between "ERROR: " and "!".
 # The warning code wraps message between "WARNING: " and "!".
 # The verbose code wraps message between "INFO: " and ".".
 # The debug code wraps message between "DEBUG: " and ".".
 # Use warning() to display WARNING (recoverable) messages.
+# Use critical() to display ERROR (fatal exceptions) messages.
 # Use error() to display ERROR (fatal) messages.
 # Use info() to only display if --verbose specified.
 # Use debug() to only display if --debug specified.
@@ -1498,6 +1500,29 @@ def warning(msg):
             prefix_bg_color=COLOR_DEFAULTS['warn_pre_bg'],
             msg_fg_color=COLOR_DEFAULTS['warn_msg_fg'],
             msg_bg_color=COLOR_DEFAULTS['warn_msf_bg'])
+    else:
+        output(msg)
+
+
+def critical(e, msg):
+    '''Simple critical wrapper to log()'''
+    # e.message  # Python 2-only
+    # e.__cause__ # Python 3-only
+    # e.__context__  # Python 3-only
+    # e.__traceback__ # Python 3-only
+    # # IOError errno (d), strerror (s), filename (?)
+    if e is not None:
+        log('Exception ' + str(e.errno) + ': ' + str(e.message),
+            prefix_fg_color=COLOR_DEFAULTS['error_pre_fg'],
+            prefix_bg_color=COLOR_DEFAULTS['error_pre_bg'],
+            msg_fg_color=COLOR_DEFAULTS['error_msg_fg'],
+            msg_bg_color=COLOR_DEFAULTS['error_msg_bg'])
+    if app_state['colorize']:
+        log(msg, prefix='[ERROR] ', suffix='!',
+            prefix_fg_color=COLOR_DEFAULTS['error_pre_fg'],
+            prefix_bg_color=COLOR_DEFAULTS['error_pre_bg'],
+            msg_fg_color=COLOR_DEFAULTS['error_msg_fg'],
+            msg_bg_color=COLOR_DEFAULTS['error_msg_bg'])
     else:
         output(msg)
 
@@ -1631,125 +1656,118 @@ def log_stdio_func(buf_to_log, log_file_name):
 # hash.py
 
 
-def create_sidecar_hash_file(filename_being_hashed, buf_to_hash, hash_file_name):
-    '''Generate a sidecar hash file for a given file.
-
-    filename_being_hashed -- filename of file that was hashed
-    buf_to_hash -- buffer of the filename to be hashed
-    hash-file_name -- filename of the sidecar hash file
-
-    Returns True if no problems, False if there were problems.
-    '''
-    if is_none_or_null(filename_being_hashed):
-        error('Hashed file name not specified')
-        return False
-    if is_none_or_null(hash_file_name):
-        error('Hash sidecar file name not specified')
-        return False
-    if is_none_or_null(buf_to_hash):
-        error('Hashed file buffer not specified')
-        return False
-    if path_exists(hash_file_name):
-        error('Hash sidecar file already exists! Not overwriting')
-        return False
+def return_hash_str_of_file(path):
+    '''For a given file, return the sha256 hash string.
+    
+    Returns a SHA256 hash string if successful, None if unsuccessful.'''
+    if is_none_or_null(path):
+        error('Filename to hash unspecified')
+        return None
+    if not path_exists(path):
+        error('File to hash does not exist: ' + path)
+        return None
+    debug('file to hash: ' + path)
+    hash_str = None
     try:
-        # _ign = warn_if_overwriting_file('create_sidecar_hash_file', hash_file_name)
-        hash_buf = hash_sha256_buffer(buf_to_hash)
-        if is_none_or_null(hash_buf):
-            error('create_sidecar_hash_file(): hash_buf is null or none')
-            return False
-        hash_file = open(hash_file_name, 'w')
-        debug('create_sidecar_hash_file(): hash_file_name = ' + hash_file_name)
-        debug('create_sidecar_hash_file(): hash_buf = ' + hash_buf)
-        debug('create_sidecar_hash_file(): buf_to_hash = ' + buf_to_hash)
-        # sha256sum file format: <hash> + <space> + <filename>
-        # XXX what about dirs? OS-specific path separators? escaping paths with spaces and other punct?
-        # XXX what tools do Windows users use, certutil.exe, ...? what formats do they expect?
-        # XXX Maybe add --hash_format=<toolname>, where <toolname> is sha256sum, certutil, ...
-        hash_file.write(hash_buf + ' ' + filename_being_hashed)  # XXX newline?
-        hash_file.close()
-    except OSError:
+        with open(path, 'rb') as f:
+            buf = f.read()
+            h = hashlib.sha256(buf)
+            h.update(buf)
+            hash_str = h.hexdigest()
+            debug('hash: ' + hash_str)
+    except OSError as e:
+        critical(e, 'failed to hash file')
+        hash_str = None
         sys.exc_info()
-        error('Problems creating sidecar hash file')
+    return hash_str
+
+
+def create_sidecar_hash_file(path):
+    '''For a given file, create a 'side-car' hash file.
+    
+    Use a sha256sum-compatible file format, a single line consisting of:
+        <hash> + <space> + <filename>
+    XXX what newline format required?
+    Future: Should support other formats, certutil.exe, etc. What formats?
+
+    Returns True if successful, False if unsuccessful.'''
+    if is_none_or_null(path):
+        error('Filename to hash unspecified')
         return False
+    if not path_exists(path):
+        error('File to hash does not exist: ' + path)
+        return False
+    debug('path of file to hash: ' + path)
+    base_filename = os.path.basename(path)
+    if is_none_or_null(base_filename):
+        error('Filename to hash unspecified')
+        return False
+    debug('base name of file to hash: ' + base_filename)
+    hash_str = return_hash_str_of_file(path)
+    if is_none_or_null(hash_str):
+        error('Hash is empty')
+        return False
+    debug('hash of file: ' + hash_str)
+    sidecar_path = path + '.sha256'
+    if path_exists(sidecar_path):
+        error('Sidecar hash file already exists, not overwriting')
+        return False
+    debug('sidecar filename: ' + sidecar_path)
+    hash_results = hash_str + ' ' + base_filename
+    debug('sidecar contents: ' + hash_results)
+    try:
+        with open(sidecar_path, 'wt') as f:
+            f.write(hash_results)
+    except OSError as e:
+        critical(e, 'Problems creating sidecar hash file')
+        sys.exc_info()
+        return False
+    debug('Finished creating sidecar file: ' + sidecar_path)
     return True
 
 
-def create_hash_file(input_ascii_file, ascii_file_hash_file):
-    '''Create a hash file.
+def create_sidecar_hash_files(path):
+    '''For a given directory 'path', create a 'side-car' hash file for each file.
 
-    input_ascii_file -- input filename
-    ascii_file_hash_file -- output filename
+    Intended to be used in each Per-Tool-Directory (PTD), where tools
+    are run, some and generate multiple files (eg, rom.bin, ACPI tables, ...)
+    This code creates a 'side-car' hash file for each generated file
+    (eg, rom.bin.sha256 for rom.bin, output.txt.sha256 for output.txt, ...).
 
-    Returns True if file was written, False if failed.
-    '''
-    if input_ascii_file is None:
-        error('Unable to generate hash file, no input filename provided')
+    Run this before generating that directory's manifest.txt file.
+    After running this, don't create any new files or modify any
+    existing files in this directory. ...except for modifying file
+    owner/group/attributes in the Unix sudo case.
+
+    Returns True if successful, False if unsuccessful.'''
+    # XXX Support (or fail with errors): dirs, files with links.
+    # XXX can a hash have a space in it, which would require escaping?
+    # XXX Support file with spaces or otherwise needing escaping
+    # XXX How does sha256sum handle escaping files (eg, with spaces)?
+    # XXX What other file formats are needed (eg, XML for one MSFT tool)?
+    if is_none_or_null(path):
+        error('Directory name to hash unspecified')
         return False
-    if ascii_file_hash_file is None:
-        error('Unable to generate hash file, no output filename provided')
+    if not dir_exists(path):
+        error('Directory to hash does not exist: ' + path)
         return False
-    _ = warn_if_overwriting_file('create_hash_file', ascii_file_hash_file)
+    debug('dir to hash: ' + path)
+    hash_fn = None
     try:
-        digest_string = hash_sha256_file(input_ascii_file)
-        debug('create_hash_file: hash=' + digest_string + ', filename=' + ascii_file_hash_file)
-        with open(ascii_file_hash_file, 'wt') as f:
-            f.write(digest_string)
-        return True
-    except:
-        error('Unable to generate hash file, unexpected exception')
+        for root, dirs, files in os.walk(path):
+            debug('root dir = ' + root)
+            for fn in files:
+                fqfn = path + os.sep + fn
+                debug('file loop: filename = ' + fn)
+                debug('file loop: fully-qualified filename = ' + fqfn)
+                create_sidecar_hash_file(fqfn)
+    except OSError as e:
+        critical(e, 'Failed to create hash file')
         sys.exc_info()
         return False
+    # XXX propogate status code upstream
+    return True
 
-
-def hash_sha256_file(filename, use_hex_dig=True):
-    '''Generate a SHA256 hash based on the contents of the file filename.
-
-    If use_hex_dig is True, generate a hex digest, else generate a digest.
-    Returns the generated hash if successful, or None if unsuccessful.
-
-    filename -- hash contents of this file
-    use_hex_dig -- if True, use a hex digest, if False use a digest
-    '''
-    try:
-        file_size_bytes = os.path.getsize(filename)
-        debug('File name to be hashed: ' + filename)
-        debug('File size (bytes) to be hashed: ' + str(file_size_bytes))
-        with open(filename, 'rb') as f:
-            buf = f.read()
-            # XXX decode('utf-8')
-            return hash_sha256_buffer(buf)
-    except:
-        sys.exc_info()
-        return None
-
-
-def hash_sha256_buffer(buf, use_hex_dig=True, use_base64_bin_dig=False):
-    '''Generate a SHA256 hash for the buffer.
-
-    If use_hex_dig is True, generate a hex digest. If use_base64_bin_dig
-    is True, generate a base64-encoded binary digest. If neither use_hex_dig
-    or use_base64_bin_digest are True, generate a binary digest.
-
-    buf -- buffer to hash
-    use_hex_dig -- if True, use hex digest format.
-    use_base64_bin_dig -- if True, use base64-encoded binary digest format.
-
-    Returns the generated hash if successful, or None if unsuccessful.
-    '''
-    try:
-        h = hashlib.sha256(buf)
-        # XXX always encode, or only for base64-bin-digest targets?
-        h.update(buf.encode('utf-8'))
-        if use_hex_dig:
-            return h.hexdigest()
-        elif use_base64_bin_dig:
-            return base64.encodestring(h.digest)
-        else:
-            return h.digest()
-    except:
-        sys.exc_info()
-        return None
 
 ############################################################
 
@@ -2020,12 +2038,6 @@ def is_valid_profile(lookup_profile,
 # refactor io-logging code in exec_native and share with python_exec code.
 
 
-def show_separator_line():
-    line = '========================================'
-    if app_state['verbose']:
-        output(line)
-
-
 def spawn_process(args, start_dir, expected_rc, toolns,
                   show_stdio=True, log_stdio=True, hash_stdio=True,
                   verbose=False):
@@ -2086,7 +2098,6 @@ def spawn_process(args, start_dir, expected_rc, toolns,
         error('Cannot hash stdio if it is not logged')
         return -6
     # info('Process starting directory: ' + start_dir)
-    # show_separator_line()
 
 #    # convert string list to a single space-delimited string
 #    for arg in args:
@@ -2170,7 +2181,7 @@ def spawn_process(args, start_dir, expected_rc, toolns,
 
     # XXX check for access denied and file not found.
     except subprocess.CalledProcessError as e:
-        error('Unexpected exception invoking process')
+        critical(e, 'Unexpected exception invoking process')
         sys.exc_info()
 
     # Log stdout/stderr, based on user preference.
@@ -2328,11 +2339,10 @@ def show_tool_stdio(start_dir, toolns, stdout_buf, stderr_buf, show_stdio, log_s
                     log_stdio_func(stderr_file, stderr_buf, stderr_file)
 
     except OSError as e:
+        critical(e, 'Unexpected exception occurred')
         sys.exc_info()
-        error('Unexpected exception occurred')
     return True
 
-#####################################################################
 #####################################################################
 
 # unsorted.py
@@ -2439,8 +2449,8 @@ def traverse_dir(dirname):
                 total_bytes += os.path.getsize(os.path.join(root, name))
                 debug('Total file size (bytes): ' + str(total_bytes))
     except OSError as e:
+        critical(e, 'Unexpected exception occurred walking directory')
         sys.exc_info()
-        error('Unexpected exception occurred walking directory')
         # return (False, None, None, None)
         return (False, dirs, files, total_bytes)
     # debug('Successfully walked directory, returning actual data')
@@ -2474,6 +2484,7 @@ def get_parent_directory_name():
     debug('Output parent directory: ' + app_state['output_dir'])
     return True
 
+
 def get_default_directory_name():
     '''Get the name of the directory where the Parent Directory is.
 
@@ -2489,8 +2500,11 @@ def get_default_directory_name():
                 if is_none_or_null(_sudo_user):
                     error('SUDO_USER environment variable is null')
                     return None
-                _dir = '/home/' + _sudo_user + '/'
-                #debug('Parent Dir (updated for SUDO usage) = ' + _dir)
+                if os_is_macos():
+                    _dir = os.path.expanduser('~') + '/'
+                else:
+                    _dir = '/home/' + _sudo_user + '/'
+                debug('Parent Dir (updated for SUDO usage) = ' + _dir)
             except:
                 error('Unable to get SUDO user home directory')
                 sys.exc_info()
@@ -2554,7 +2568,7 @@ def sudo_user_diags():
     debug('Homedir = ' + pwname_home_dir)
 
 
-def set_groups(path, new_uid, new_gid, verbose=False):
+def set_groups(path, new_uid, new_gid, verbose=True):
     '''For sudo case, set GID to non-SuperUser value.'''
     if not app_state['sudo_based_usage']:
         debug('set_groups: called for non-sudo use')
@@ -2568,13 +2582,14 @@ def set_groups(path, new_uid, new_gid, verbose=False):
         os.setgroups([])
         if verbose:
             debug('calling os.setgroups(' + str(new_gid_list) + ')..')
-        os.setgroups(new_gid_list)
+        # os.setgroups(new_gid_list)  # XXX macOS: ValueError: too many groups
+        os.setgroups([new_gid_list[0]])  # XXX macOS: ValueError: too many groups
         if verbose:
             debug('calling os.setgid(' + str(new_gid) + ')..')
         os.setgid(new_gid)
     except OSError as e:
+        critical(e, 'Unable to to update UID on file: ' + path)
         sys.exc_info()
-        error('Unable to to update UID on file: ' + path)
         log('Exception ' + str(e.errno) + ': ' + str(e))
         return False
     return True
@@ -2589,9 +2604,8 @@ def set_owner(path, new_uid, new_gid):
         debug('Changing file owner: file=' + path + ', uid=' + str(new_uid))
         os.chown(path, new_uid, new_gid)
     except OSError as e:
+        critical(e, 'Unable to update GID on file: ' + path)
         sys.exc_info()
-        debug('Unable to update GID on file: ' + path)  # XXX error()
-        debug('Exception ' + str(e.errno) + ': ' + str(e))  # XXX log()
         return False
     return True
 
@@ -2634,9 +2648,8 @@ def change_file_mode(path, new_mode):
     try:
         os.chmod(path, new_mode)
     except OSError as e:
+        critical(e, 'Unable to modify mode on path: ' + path)
         sys.exc_info()
-        debug('Unable to modify mode on path: ' + path)  # XXX error()
-        debug('ERROR: Exception ' + str(e.errno) + ': ' + str(e))  # XXX log()
         return False
     return True
 
@@ -2670,7 +2683,6 @@ def change_generated_file_perms(path, verbose=False):
     if path is None:
         error('Must specify path to set')
         return False
-
     # XXX This whole section: duplicate code, use existing function
     new_uid = int(os.environ.get('SUDO_UID'))
     if new_uid is None:
@@ -2688,29 +2700,20 @@ def change_generated_file_perms(path, verbose=False):
     rwx_mode = (stat.S_IRWXU|stat.S_IRWXG|stat.S_IRWXO) 
     new_dir_mode = rwx_mode
     new_file_mode = rwx_mode
-    if verbose:
-        debug('new file mode: ' + str(new_file_mode))
-    if verbose:
-        debug('new dir mode: ' + str(new_dir_mode))
-
+    debug('new file mode: ' + str(new_file_mode))
+    debug('new dir mode: ' + str(new_dir_mode))
     for root, dirs, files in os.walk(path):  
-        if verbose:
-            debug('root dir = ' + root)
+        debug('root dir = ' + root)
         for d in dirs:  
-            if verbose:
-                debug('dir = ' + d)
+            debug('dir = ' + d)
             joined = os.path.join(path, d)
-            if verbose:
-                debug('joined dir = ' + joined)
+            debug('joined dir = ' + joined)
             change_file_owner_group(joined, int(new_uid), int(new_gid))
             change_file_mode(joined, int(new_dir_mode))
-
         for f in files:
-            if verbose:
-                debug('file = ' + f)
-            joined = os.path.join(path, f)
-            if verbose:
-                debug('joined file = ' + joined)
+            debug('file = ' + f)
+            joined = os.path.join(root, f)
+            debug('joined file = ' + joined)
             change_file_owner_group(joined, int(new_uid), int(new_gid))
             change_file_mode(joined, int(new_dir_mode))
     # XXX propogate status code upstream
@@ -2916,11 +2919,10 @@ def setup_per_tool_directory(pd, prd, ptd, toolns):
             if not dir_exists(ptd):
                 error('Problems creating per-tool-directory')
                 return False
-        except OSError:
+        except OSError as e:
+            critical(e, 'Problems creating per-tool-directory')
             sys.exc_info()
-            error('Problems creating per-tool-directory')
             return False
-
     (new_dir_mode, new_uid, new_gid) = get_sudo_user_group_mode()
     change_file_owner_group(ptd, new_uid, new_gid)
     change_file_mode(ptd, new_dir_mode)
@@ -2961,19 +2963,18 @@ def setup_parent_directory(new_dir_mode, new_uid, new_gid):
     try:
         os.mkdir(pd)
         if not dir_exists(pd):
-            error('Problems creating parent directory')
+            error('Parent directory was not created')
             return False
     except OSError as e:
+        critical(e, 'Failed to create parent directory: ' + pd)
         sys.exc_info()
-        error('Problems creating parent directory')
         return False
-
     # XXX only do this if using sudo codepath
     debug('Updating owner/attribs of Parent Directory')
     change_file_owner_group(pd, new_uid, new_gid)
     change_file_mode(pd, new_dir_mode)
-
     return True
+
 
 def run_meta_profile(pd, prd):
     '''Loop through and run each of the tools in the meta_profile.'''
@@ -3003,25 +3004,25 @@ def run_meta_profile(pd, prd):
                 debug('Created per-tool directory: ' + ptd)
             # At this point, we should have a PRD/PTD dir setup to run tool in.
         except OSError as e:
+            critical(e, 'OSError trying to create tool directory')
             sys.exc_info()
             # XXX: check if OSError is File Not Found
             # except FileNotFoundError as e:
             # error('File Not Found: tool needs to be installed in PATH')
-            error('OSError trying to create tool directory')
             return False
         # Call tool resolver, to determine which variation (namespace) of a tool to run
         rc = tool_resolver(toolns, pd, prd, ptd)
         # XXX Confirm failure rc is logged in tool_resolver() or finish_results()
         debug('Post-tool-resolution, rc = ' + str(rc))
-
-    if app_state['hash_mode']:
-        if not create_sidecar_hash_files(ptd):
-            error('Unable to create side-car hash file(s) in PTD directory: ' + ptd)
-            return False
-    if app_state['manifest_mode']:
-        if not create_manifest_file(ptd):
-            error('Unable to create PTD manifest file in directory: ' + ptd)
-            return False
+        if app_state['hash_mode']:
+            if not create_sidecar_hash_files(ptd):
+                error('Unable to create side-car hash file(s) in PTD directory: ' + ptd)
+                return False
+        if app_state['manifest_mode']:
+            debug('***** MANIFEST MODE:.....')
+            if not create_manifest_file(ptd):
+                error('Unable to create PTD manifest file in directory: ' + ptd)
+                return False
     # finish_results()
     # XXX propogate error upstream
     return True
@@ -3181,7 +3182,6 @@ def get_tool_info(toolns):
 
 
 #####################################################################
-
 
 # util.py
 
@@ -3416,6 +3416,50 @@ def is_user_root():
     return root
 
 
+def diagnose_groups(uid_name_string, gid_name_string):
+    '''TBW'''
+    # XXX test when user and/or root is a member of multiple groups
+    # test if macOS/FreeBSD behavior is the same as Linux. See the Python
+    # documentation Note for os.getgroups() and os.setgrups().
+    for (name, passwd, gid, members) in grp.getgrall():
+        debug('name=' + name + ',  gid=' + str(gid) + ', members=' + str(members))
+        # if username in members: gids.append(gid)
+    all_groups = grp.getgrall()
+    # output_wrapped(all_groups)
+    # debug(str(all_groups))
+    #for g in all_groups:
+        #output_wrapped(str(g))
+        # debug(str(g))
+    groups = os.getgroups()
+    #for g in groups:
+        #output_wrapped(str(g))
+        # debug(str(g))
+    gname = gid_name_string
+    uname = uid_name_string
+    print('uname: ' + uname)
+    print('gname: ' + gname)
+
+    if not os_is_macos():
+        gid = int(grp.getgrnam(gname)[2])
+        uid = int(grp.getgrnam(gname)[2])
+        print('grname uid: ' + str(uid))
+        print('grname gid: ' + str(gid))
+
+        uid = int(pwd.getpwnam(uname).pw_uid)
+        gid = int(grp.getgrnam(gname).gr_gid)
+        print('pwname uid: ' + str(uid))
+        print('grname gid: ' + str(gid))
+
+    cur_uid = os.getuid()
+    cur_uid_name = pwd.getpwuid(os.getuid())[0]
+    cur_gid = os.getgid()
+    cur_group = grp.getgrgid(os.getgid())[0]
+    print('uid: ' + str(cur_uid))
+    print('uid name: ' + str(cur_uid_name))
+    print('gid: ' + str(cur_gid))
+    print('group: ' + str(cur_group))
+
+
 def show_sudo_vars():
     '''Show SUDO-centric environment variables, on Unix.
 
@@ -3509,8 +3553,8 @@ def show_environment_variable(var_name):
         else:
             return 0
     except OSError as e:
+        critical(e, 'showenv: OSError exception occurred')
         sys.exc_info()
-        error('showenv: OSError exception occurred')
     return False
 
 
@@ -4383,8 +4427,6 @@ def chipsec_uefi_nvram_auth(toolns, tool, prd, ptd, erc):
 #####################################################################
 
 # acpica-tools.py
-
-
 # XXX acpixtract()
 
 
@@ -4714,6 +4756,7 @@ def lspci_xxx(toolns, tool, prd, ptd, erc):
 
 # Detect Intel SA-00075 aka: CVE-2017-5689 AMT vulnerability
 
+
 def intel_amt_discovery(toolns, tool, prd, ptd, erc):
     '''Run live command: 'INTEL-SA-00075-Discovery-Tool'.'''
     if not os_is_linux():
@@ -4755,123 +4798,10 @@ def pawn(toolns, tool, prd, ptd, erc):
     cmd = [tool, '-v']
     return spawn_process(cmd, ptd, erc, toolns)
 
+
 #####################################################################
-#####################################################################
 
-
-def diagnose_groups(uid_name_string, gid_name_string):
-    '''TBW'''
-    # XXX test when user and/or root is a member of multiple groups
-    # test if macOS/FreeBSD behavior is the same as Linux. See the Python
-    # documentation Note for os.getgroups() and os.setgrups().
-    for (name, passwd, gid, members) in grp.getgrall():
-        debug('name=' + name + ',  gid=' + str(gid) + ', members=' + str(members))
-        # if username in members: gids.append(gid)
-    all_groups = grp.getgrall()
-    # output_wrapped(all_groups)
-    # debug(str(all_groups))
-    #for g in all_groups:
-        #output_wrapped(str(g))
-        # debug(str(g))
-    groups = os.getgroups()
-    #for g in groups:
-        #output_wrapped(str(g))
-        # debug(str(g))
-    gname = gid_name_string
-    uname = uid_name_string
-    print('uname: ' + uname)
-    print('gname: ' + gname)
-    gid = int(grp.getgrnam(gname)[2])
-    uid = int(grp.getgrnam(gname)[2])
-    print('uid: ' + str(uid))
-    print('gid: ' + str(gid))
-    uid = int(pwd.getpwnam(uname).pw_uid)
-    gid = int(grp.getgrnam(gname).gr_gid)
-    print('uid: ' + str(uid))
-    print('gid: ' + str(gid))
-    cur_uid = os.getuid()
-    cur_uid_name = pwd.getpwuid(os.getuid())[0]
-    cur_gid = os.getgid()
-    cur_group = grp.getgrgid(os.getgid())[0]
-    print('uid: ' + str(cur_uid))
-    print('uid name: ' + str(cur_uid_name))
-    print('gid: ' + str(cur_gid))
-    print('group: ' + str(cur_group))
-
-#######################################
-
-def do_hash(fn, hash_fn):
-    '''TBW'''
-    if is_none_or_null(fn):
-        error('Cannot create hash file, filename to hash is null')
-        return False
-    if is_none_or_null(hash_fn):
-        error('Cannot create hash file, hash filename is null')
-        return False
-    debug('do_hash_file: fn = ' + fn)
-    debug('do_hash_file: hash_fn = ' + hash_fn)
-    try:
-        f = open(hash_fn, 'rb')  # encoding='utf-8' , errors='strict')
-        # XXX test size before reading into memory
-        file_buf = f.read()  # .decode('utf-8')
-        f.close()
-        if not is_none_or_null(file_buf):
-            # hash_fn = fn + '.sha256'
-            info('Creating side-car hash file: ' + hash_fn)
-            create_sidecar_hash_file(fn, file_buf, hash_fn)
-        file_buf = None
-    except IOError as e:
-        log('Exception ' + str(e.errno) + ': ' + str(e))
-        error('Error while creating hash file')
-        sys.exc_info()
-        return False
-    return True
-
-
-def create_sidecar_hash_files(path):
-    '''For each file in a directory, create a new side-car hash file.
-
-    Intended to be used in each Per-Tool-Directory (PTD), where tools
-    are run, some and generate multiple files (eg, rom.bin, ACPI tables, ...)
-    This code creates a 'side-car' hash file for each generated file
-    (eg, rom.bin.sha256 for rom.bin, output.txt.sha256 for output.txt, ...).
-
-    Run this before generating that directory's manifest.txt file.
-    After running this, don't create any new files or modify any
-    existing files in this directory. ...except for modifying file
-    owner/group/attributes in the Unix sudo case.
-
-    Returns True if successful, False if an error occurred.'''
-    # XXX Support (or fail with errors): dirs, files with links.
-    # XXX can a hash have a space in it, which would require escaping?
-    # XXX Support file with spaces or otherwise needing escaping
-    # XXX How does sha256sum handle escaping files (eg, with spaces)?
-    # XXX What other file formats are needed (eg, XML for one MSFT tool)?
-    HASH_FILENAME_EXTENSION = '.sha256'
-    if is_none_or_null(path):
-        error('Cannot create hash files, directory is null')
-        return False
-    if not dir_exists(path):
-        error('Cannot create hash files, directory does not exist: ' + path)
-        return False
-    hash_fn = None
-    try:
-        for root, dirs, files in os.walk(path):
-            debug('create_hash_file: root dir = ' + root)
-            for fn in files:
-                joined = os.path.join(path, fn)
-                hash_fn = joined + HASH_FILENAME_EXTENSION
-                debug('create_hash_file: fn = ' + fn)
-                debug('create_hash_file: joined = ' + joined)
-                debug('create_hash_file: hash_fn = ' + hash_fn) 
-                status = do_hash(joined, hash_fn)  # use joined for fn!
-    except OSError as e:
-        error('Failed to create hash file')
-        log('Exception ' + str(e.errno) + ': ' + str(e))
-        sys.exc_info()
-        return False
-    # XXX propogate status code upstream
-    return True
+# manifest.py
 
 
 def create_manifest_file(path):
@@ -4897,6 +4827,16 @@ def create_manifest_file(path):
         error('Not overwriting existing manifest file: ' + fn)
         return False
     try:
+
+#    buf = None
+#    for fn in generated_files:
+#        buf += hash_line
+#        # calc hash
+#        # with open('manifest.txt', 'wt', encodin='utf-8') as f:
+#        f = open('manifest.txt', 'wt', encodin='utf-8')
+#        f.write(buf)
+#        f.close()
+
         # Open the manifest file
         debug('Opening manifest file: ' + fn)
         m = open(fn, 'wt')  # , encoding='utf-8')  # , errors='strict')
@@ -4907,36 +4847,32 @@ def create_manifest_file(path):
                 debug('make_manifest: current file = ' + f)
                 joined = os.path.join(path, f)
                 debug('make_manifest: current joined file = ' + joined)
-                # The next few lines can probably be replaced with a hash function
-                f_fn = open(f, 'rb')  # , encoding='utf-8', errors='strict')
-                file_buf = f_fn.read()
-                f_fn.close()
-                debug('make_manifest: x')
-                hash_buf = hash_sha256_buffer(file_buf)
-                # Check if hash_buf is null.
-
+                hash_buf = return_hash_str_of_file(joined)
+                if is_none_or_null(hash_buf):
+                    error('Hash buffer is null')
+                    m.close()
+                    return False
+                debug('make_manifest: hash string: ' + hash_buf)
                 manifest_line = hash_buf + ' ' + f + os.linesep
                 if is_none_or_null(manifest_line):
                     error('Manifest record line is null!')
                 debug('make_manifest: manifest line: ' + manifest_line)
                 m.write(manifest_line)
-                m.flush()
         debug('Closing manifest file')
         m.close()
     except IOError as e:
-        error('IOError: Failed to create manifest file: ' + fn)
-        log('Exception ' + str(e.errno) + ': ' + str(e))
+        critical(e, 'IOError: Failed to create manifest file: ' + fn)
         sys.exc_info()
         return False
     except OSError as e:
-        error('OSError: Failed to create manifest file: ' + fn)
-        log('Exception ' + str(e.errno) + ': ' + str(e))
+        critical(e, 'OSError: Failed to create manifest file: ' + fn)
         sys.exc_info()
         return False
     # XXX propogate status code upstream
     return True
 
-#######################################
+
+#####################################################################
 
 
 # The initial main entry point, which calls main().
