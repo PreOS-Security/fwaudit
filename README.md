@@ -109,6 +109,13 @@ https://downloadcenter.intel.com/download/26755/INTEL-SA-00075-Detection-and-Mit
 
 sudo cp INTEL-SA-00075-Discovery-Tool /usr/local/sbin/
 
+Install INTEL-SA-00086-Detection-Tool (messy!):
+
+mkdir sa00086
+cd sa00086
+tar -xvzf SA00086_Linux.tar.gz
+sudo cp -r * /usr/local/sbin
+
 Download fwaudit:
 
 git clone https://github.com/PreOS-Security/fwaudit.git

@@ -38,6 +38,8 @@ A few suggestions for any developers who wish to contribute:
 ## Core App Features:
 
 * Split into multiple source files
+* Prep for proper PyPy packaging
+  * Including proper dependency on CHIPSEC
 * Watch for crashed exec tools, watchdog process, kill after timeout?
 * Check if needed tool is available before running, SKIP relevent tests
 * Validate user input, max buf overflow, escape/canonlize
